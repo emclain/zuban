@@ -1,0 +1,7 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "server",
+  "dolt_database": "zuban",
+  "project_id": "ea447646-8f09-4291-9f84-3760d61d436b"
+}
