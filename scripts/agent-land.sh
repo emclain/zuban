@@ -55,6 +55,13 @@ bd_run() {
 echo "=== Quality gates ==="
 # Isolate build artifacts to this worktree to avoid cross-instance file-lock conflicts.
 export CARGO_TARGET_DIR="$WORKTREE_ROOT/target"
+# Remove any hardlinked .o files — on overlayfs, cargo cannot atomically replace
+# files with nlink>1 and fails with EPERM. These are stale artifacts from worktree
+# creation; removing them forces a clean recompile of only the affected objects.
+find "$CARGO_TARGET_DIR/debug/deps" -name "*.o" 2>/dev/null | while read -r f; do
+  nlinks=$(stat -c%h "$f" 2>/dev/null || echo 1)
+  [ "$nlinks" -gt 1 ] && rm -f "$f"
+done || true
 cargo test
 
 # ── 2. Close the issue ───────────────────────────────────────────────────────
