@@ -146,13 +146,14 @@ git branch -d "work/$CLAIMED_ID"
 
 Before stopping, review the session for friction, gaps, or follow-up work. This step is **not optional** — do not skip it.
 
-Fix in-place (don't just file a bead, also fix it):
+**For every issue you encountered or discovered (permission errors, missing steps, unclear instructions, new edge cases):**
+
+Fix in-place:
 - **If `scripts/agent-start.sh` or `agent-land.sh` failed or was incomplete:** improve the script.
 - **If setup instructions in AGENTS.md were wrong or missing a step:** update them.
 - **If a new category of obstacle appeared:** add it to the script's guard logic.
 
-**For every issue you encountered or discovered (permission errors, missing steps, unclear instructions, new edge cases):**
-
+Then file and push a bead:
 1. **File a bead** — `bd create --title="..." --description="..." --type=task --priority=<n>`
 2. **Push it** — beads are only persisted when `bd export > .beads/issues.jsonl` is committed and pushed. If `agent-land.sh` already did this, verify your new issue id appears in the pushed `.beads/issues.jsonl`. If not, run the export/commit/push sequence again.
 
