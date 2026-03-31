@@ -148,14 +148,14 @@ Before stopping, review the session for friction, gaps, or follow-up work. This 
 
 **For every issue you encountered or discovered (permission errors, missing steps, unclear instructions, new edge cases):**
 
-Fix in-place:
+Fix in-place (only when the fix is clear and unambiguous):
 - **If `scripts/agent-start.sh` or `agent-land.sh` failed or was incomplete:** improve the script.
 - **If setup instructions in AGENTS.md were wrong or missing a step:** update them.
 - **If a new category of obstacle appeared:** add it to the script's guard logic.
 
-Then file and push a bead:
+File a bead for anything requiring deeper investigation or design, and for any fix-in-place changes you made:
 1. **File a bead** — `bd create --title="..." --description="..." --type=task --priority=<n>`
-2. **Push it** — beads are only persisted when `bd export > .beads/issues.jsonl` is committed and pushed. If `agent-land.sh` already did this, verify your new issue id appears in the pushed `.beads/issues.jsonl`. If not, run the export/commit/push sequence again.
+2. **Push any new beads** — run `bd export > .beads/issues.jsonl`, commit, and push to `jedi-compare`.
 
 **If workflow was smooth with no issues:** write one sentence saying so — no bead needed.
 
