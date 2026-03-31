@@ -9,3 +9,6 @@
 .dolt/
 *.db
 .beads-credential-key
+# Beads runtime state (audit log, temp files)
+.beads/interactions.jsonl
+.beads/zuban-*
