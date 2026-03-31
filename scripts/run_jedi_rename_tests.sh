@@ -51,8 +51,14 @@ if [[ ! -f "$BINARY" ]]; then
     exit 1
 fi
 
+TYPESHED="$ZUBAN_DIR/third_party/typeshed"
+if [[ ! -d "$TYPESHED" ]]; then
+    echo "Error: typeshed not found at $TYPESHED" >&2
+    exit 1
+fi
+
 echo "Running jedi rename tests against $BINARY..."
 cd "$JEDI_DIR"
-python3 -m pytest test/test_lsp_rename.py \
+ZUBAN_TYPESHED="$TYPESHED" python3 -m pytest test/test_lsp_rename.py \
     --lsp-cmd="$BINARY server" \
     "${PYTEST_ARGS[@]}"
