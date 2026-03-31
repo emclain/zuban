@@ -136,6 +136,7 @@ export CLAIMED_ID=$claimed
 export BEADS_ACTOR="agent-$(hostname)-$$"
 export ZUBAN_TYPESHED=$REPO_ROOT/third_party/typeshed
 export JEDI_DIR=$JEDI_DIR
+export CARGO_TARGET_DIR=$worktree_abs/target
 EOF
 
 echo ""

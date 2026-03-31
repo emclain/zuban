@@ -53,6 +53,8 @@ bd_run() {
 
 # ── 1. Quality gates ─────────────────────────────────────────────────────────
 echo "=== Quality gates ==="
+# Isolate build artifacts to this worktree to avoid cross-instance file-lock conflicts.
+export CARGO_TARGET_DIR="$WORKTREE_ROOT/target"
 cargo test
 
 # ── 2. Close the issue ───────────────────────────────────────────────────────
