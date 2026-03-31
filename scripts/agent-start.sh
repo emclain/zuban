@@ -48,18 +48,45 @@ if ! command -v jq &>/dev/null; then
   exit 1
 fi
 
-# ── 3. Initialize beads if not already done ──────────────────────────────────
+# ── 3. Ensure Rust/cargo is available ────────────────────────────────────────
+if ! command -v cargo &>/dev/null; then
+  source "$HOME/.cargo/env" 2>/dev/null || true
+fi
+if ! command -v cargo &>/dev/null; then
+  echo "ERROR: cargo not found. Install Rust from https://rustup.rs" >&2
+  exit 1
+fi
+
+# ── 3b. Ensure zuban debug binary is built ───────────────────────────────────
+if [ ! -f "$REPO_ROOT/target/debug/zuban" ]; then
+  echo "Building zuban (first run, may take a few minutes)..."
+  cargo build
+fi
+
+# ── 3c. Ensure jedi repo is checked out alongside ────────────────────────────
+JEDI_DIR="$(cd "$REPO_ROOT/.." && pwd)/jedi"
+if [ ! -d "$JEDI_DIR" ]; then
+  echo "Cloning jedi alongside zuban..."
+  git clone https://github.com/emclain/jedi "$JEDI_DIR" --branch refactoring-test-coverage
+fi
+if [ ! -d "$JEDI_DIR/.venv" ]; then
+  echo "Setting up jedi Python venv..."
+  python3 -m venv "$JEDI_DIR/.venv"
+  "$JEDI_DIR/.venv/bin/pip" install -q -e "$JEDI_DIR/[testing]"
+fi
+
+# ── 4. Initialize beads if not already done ──────────────────────────────────
 if ! bd list &>/dev/null 2>&1; then
   echo "Initializing beads database..."
   bd init --force --prefix zuban
   bd import
 fi
 
-# ── 4. Pull latest ────────────────────────────────────────────────────────────
+# ── 5. Pull latest ────────────────────────────────────────────────────────────
 echo "Pulling latest from origin/jedi-compare..."
 git pull origin jedi-compare
 
-# ── 5. Claim one issue ───────────────────────────────────────────────────────
+# ── 6. Claim one issue ───────────────────────────────────────────────────────
 claimed=""
 for id in $(bd ready --json --limit 10 | jq -r '.[].id'); do
   if bd update "$id" --claim 2>/dev/null; then
@@ -75,7 +102,7 @@ fi
 
 echo "Claimed issue: $claimed"
 
-# ── 6. Create isolated worktree ──────────────────────────────────────────────
+# ── 7. Create isolated worktree ──────────────────────────────────────────────
 worktree="../zuban-${claimed}"
 worktree_abs="$(cd .. && pwd)/zuban-${claimed}"
 
@@ -103,10 +130,12 @@ fi
 
 echo "Worktree created at: $worktree_abs"
 
-# ── 7. Write .agent-env ──────────────────────────────────────────────────────
+# ── 8. Write .agent-env ──────────────────────────────────────────────────────
 cat > "$worktree/.agent-env" <<EOF
 export CLAIMED_ID=$claimed
 export BEADS_ACTOR="agent-$(hostname)-$$"
+export ZUBAN_TYPESHED=$REPO_ROOT/third_party/typeshed
+export JEDI_DIR=$JEDI_DIR
 EOF
 
 echo ""
@@ -117,3 +146,6 @@ echo "  bd show $claimed"
 echo ""
 echo "When done (work committed), land with:"
 echo "  bash scripts/agent-land.sh"
+echo ""
+echo "To run rename tests:"
+echo "  bash scripts/run_jedi_rename_tests.sh"
