@@ -153,7 +153,7 @@ Fix in-place (only when the fix is clear and unambiguous):
 - **If setup instructions in AGENTS.md were wrong or missing a step:** update them.
 - **If a new category of obstacle appeared:** add it to the script's guard logic.
 
-File a bead for anything requiring deeper investigation or design, and for any fix-in-place changes you made:
+File a bead for anything requiring deeper investigation or design:
 1. **File a bead** — `bd create --title="..." --description="..." --type=task --priority=<n>`
 2. **Push any new beads** — run `bd export > .beads/issues.jsonl`, commit, and push to `jedi-compare`.
 
