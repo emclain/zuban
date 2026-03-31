@@ -104,6 +104,14 @@ File beads for anything you noticed but didn't work on — related issues, edge 
 bd create --title="..." --type=task --priority=<n>
 ```
 
+If the new bead requires changes to the **core zuban codebase** (server-side rename logic, new LSP capabilities, etc.) rather than the test harness or adapter, mark it deferred immediately:
+
+```bash
+bd update <id> --status deferred
+```
+
+Core zuban work is out of scope for this project until prioritized separately. Only test harness, adapter (`lsp_compat.py`), and fixture/script work is in scope.
+
 Then run the landing script:
 
 ```bash
