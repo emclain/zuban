@@ -71,12 +71,6 @@ Zuban returns null/error when asked to rename an undefined variable, while jedi 
 ### Multi-File Renames
 As expected for single-file testing, zuban only returns edits for the current file. Import renames, module renames, and cross-file references are not tested here since the adapter only sends one file to the server. This accounts for 8 of the 15 failures and is not necessarily a zuban deficiency.
 
-## Setup Issues Discovered
-
-- `ZUBAN_TYPESHED` must be set to `third_party/typeshed` (the submodule must be initialized with `git submodule update --init third_party/typeshed`)
-- Without it the server panics on `didOpen`; `scripts/run_jedi_rename_tests.sh` now handles this automatically
-- The `--stdio` flag is not valid; the correct invocation is `zuban server`
-
 ## Follow-Up Beads Filed
 
 - **zuban-0nm**: Rename: keyword argument call sites not updated

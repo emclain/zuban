@@ -52,15 +52,23 @@ bd list
 ## Setup
 
 ```bash
-# Initialize submodules (required for tests)
+# Initialize submodules (required — includes third_party/typeshed which zuban
+# needs at runtime; without it the server panics on the first didOpen)
 git submodule update --init
 
 # Build the project
 cargo build
 
-# Run tests
+# Run Rust tests
 cargo test
+
+# Run jedi rename fixture tests against zuban
+# (sets ZUBAN_TYPESHED automatically; requires ../jedi to be checked out)
+bash scripts/run_jedi_rename_tests.sh
 ```
+
+> **Note:** `zuban server` is the correct invocation for stdio LSP mode.
+> `zuban --stdio` is not a valid flag and will cause the server to fail to start.
 
 ## Multi-Agent Parallelism
 
