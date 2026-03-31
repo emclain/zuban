@@ -54,5 +54,5 @@ fi
 echo "Running jedi rename tests against $BINARY..."
 cd "$JEDI_DIR"
 python3 -m pytest test/test_lsp_rename.py \
-    --lsp-cmd="$BINARY --stdio" \
+    --lsp-cmd="$BINARY server" \
     "${PYTEST_ARGS[@]}"
