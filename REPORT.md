@@ -78,3 +78,85 @@ As expected for single-file testing, zuban only returns edits for the current fi
 - **zuban-b0w**: Rename: module/file rename not implemented
 - **zuban-z07**: Rename: string annotations not updated (forward references)
 - **zuban-ljo**: Rename: var-not-found, keyword-param2, nonlocal-rename return null unexpectedly
+
+---
+
+## Jedi Refactoring Integration Analysis
+
+### Background
+
+Investigation into whether jedi's Python refactoring operations (extract_variable,
+extract_function, inline, introduce_parameter, introduce_field) could be integrated
+into zuban, and what form that integration would take.
+
+### CST Comparison: parsa_python vs parso
+
+Both are full-fidelity lossless CSTs that can round-trip source code exactly.
+
+| Dimension | zuban (parsa_python) | jedi (parso) |
+|---|---|---|
+| Storage | Flat `Vec<InternalNode>`, 16 bytes/node | Linked pointer tree (Python objects) |
+| Position | Byte offset (u32) | (line, col) tuples, 1-indexed |
+| Whitespace/comments | Retrieved via `prefix_to_previous_leaf()` | Pre-attached as `Leaf.prefix` string |
+| Node types | Enum (`Terminal(TerminalType::Name)`, etc.) | Class hierarchy (~20 specialised leaf types) |
+| Parent navigation | O(n) backward scan through Vec | O(1) via stored pointer |
+| Sibling/child iteration | `iter_children()`, offset arithmetic | `node.children` list, direct indexing |
+
+The flat Vec layout is cache-friendly for tree walks. The main ergonomic difference
+is that parso pre-attaches whitespace/comments to the following leaf as `.prefix`,
+while parsa_python requires an explicit call to retrieve trivia. Jedi's refactoring
+code uses `.prefix` heavily; porting would need a thin wrapper.
+
+The key incompatibility for porting is **position representation**: jedi uses
+(line, col) tuples throughout its refactoring code; zuban uses byte offsets.
+Conversion is lossless but requires scanning for newlines — a cached line-start
+table (which zuban likely already builds for LSP diagnostics) would handle this.
+
+### Semantic Requirements vs Zuban's Existing Capabilities
+
+Zuban is a full language server. Most of what jedi's refactoring needs from its
+inference engine is already present in zuban:
+
+| Operation | Cross-file refs | Data flow | Pure CST | Zuban readiness |
+|---|---|---|---|---|
+| Rename | yes | no | no | ~95% — `references_for_rename()` exists and is LSP-wired |
+| Inline | yes (refs + def) | no | heavy | ~80% — `references()` + `goto()` exist |
+| Extract Variable | no | no | 100% | 100% — no inference needed |
+| Extract Function | yes (free vars) | yes | partial | ~70% — one gap (below) |
+| Introduce Parameter | no | no | 100% | 100% — no inference needed |
+
+**The one semantic gap** is in extract_function: classifying each free variable in
+the extracted range as an *input* (defined outside → becomes a parameter) or
+*output* (defined inside → becomes a return value). Jedi does this by calling
+`context.goto(name)` and checking whether the definition falls within the extracted
+range. Zuban has `goto()` already; what's missing is a thin wrapper:
+
+```rust
+fn is_name_defined_in_range(doc, name, range_start, range_end) -> bool
+```
+
+### Integration Options
+
+**Subprocess/JSON-RPC wrapper** — lightest path for prototyping. A thin Python shim
+takes a JSON request and returns a JSON diff. Zuban spawns a persistent subprocess
+with stdin/stdout. No new Rust dependencies; jedi stays pure Python. Downside:
+subprocess startup latency (mitigated by keeping the process alive), and a Python
+runtime dependency that conflicts with zuban's standalone value proposition.
+
+**Native Rust implementation** — right long-term answer. Zuban already has the CST
+and the inference infrastructure. The work is CST manipulation (expression boundary
+detection, precedence analysis, scope insertion point selection) plus one new
+semantic helper for extract_function. No new inference capabilities are needed.
+Mechanical porting effort estimated at ~200–300 lines of adapter/wrapper code plus
+systematic translation of the refactoring logic itself.
+
+**PyO3 (embedded Python)** — single-process, direct API access, no serialisation
+overhead. Significant architectural cost: adds a Python runtime dependency to what
+is currently a standalone Rust binary.
+
+### Conclusion
+
+A native Rust implementation is the right path. The semantic infrastructure is
+~90% already present in zuban. The remaining work is CST manipulation logic plus
+one new `is_name_defined_in_range` helper — building on solid foundations rather
+than starting from scratch.
