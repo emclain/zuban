@@ -152,12 +152,15 @@ Fix in-place (only when the fix is clear and unambiguous):
 - **If `scripts/agent-start.sh` or `agent-land.sh` failed or was incomplete:** improve the script.
 - **If setup instructions in AGENTS.md were wrong or missing a step:** update them.
 - **If a new category of obstacle appeared:** add it to the script's guard logic.
+- **If any step is currently prose instructions:** convert it to scripted commands.
 
 File a bead for anything requiring deeper investigation or design:
 1. **File a bead** — `bd create --title="..." --description="..." --type=task --priority=<n>`
 2. **Push any new beads** — run `bd export > .beads/issues.jsonl`, commit, and push to `jedi-compare`.
 
 **If workflow was smooth with no issues:** write one sentence saying so — no bead needed.
+
+The goal: the next agent should be able to run `bash scripts/agent-start.sh`, do their work, and run `bash scripts/agent-land.sh` with no manual intervention.
 
 **Stop after one issue.** Do not loop back to claim another.
 
