@@ -12,3 +12,6 @@
 # Beads runtime state (audit log, temp files)
 .beads/interactions.jsonl
 .beads/zuban-*
+
+# Beads / Dolt files (added by bd init)
+.beads/proxieddb/

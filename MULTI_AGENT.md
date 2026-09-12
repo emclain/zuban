@@ -176,14 +176,25 @@ The goal: the next agent should be able to run `bash scripts/agent-start.sh`, do
 
 ## Beads State Persistence
 
-`bd dolt push` is **not configured** in this environment. Beads state is persisted through the git-tracked `.beads/issues.jsonl` file.
+As of the beads v1.2.2 upgrade, `bd init` auto-configures a Dolt remote (`origin`) pointing at
+this repo's own git remote, syncing via a `refs/dolt/data` ref namespace — no separate hosted
+Dolt server needed. `bd dolt push` / `bd dolt pull` work in this environment and are confirmed
+functional (tested 2026-09-12).
+
+Use both, not one or the other:
 
 ```bash
-bd export > .beads/issues.jsonl
+bd dolt push                      # syncs the full Dolt DB (history, audit trail) via refs/dolt/data
+bd export > .beads/issues.jsonl   # keeps the git-tracked snapshot in sync too
 git add .beads/issues.jsonl
 git commit -m "bd sync: ..."
 git push origin <branch>:jedi-compare
 ```
+
+The jsonl export stays mandatory even though dolt push works: it's what `bd init --force && bd import`
+bootstraps from on a fresh checkout (see AGENTS.md), and it keeps issue changes visible in normal
+PR diffs. `bd dolt push` alone would leave fresh checkouts with nothing to import until they also
+run `bd dolt pull`, and wouldn't surface issue changes in code review.
 
 ## Why This Is Safe
 
