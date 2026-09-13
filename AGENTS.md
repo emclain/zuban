@@ -25,28 +25,31 @@ This project uses **bd** (beads) for issue tracking. Run `bd onboard` to get sta
 
 ## Beads Setup (fresh checkout)
 
-Beads requires the `bd` CLI and a local Dolt database. On a new machine or container:
+Beads requires the `bd` CLI and the `dolt` binary. This project runs beads in server mode, where
+`bd` runs a local `dolt sql-server` for the checkout (see "Beads Database" in MULTI_AGENT.md).
+On a new machine or container:
 
 ```bash
 # 1. Install the bd CLI
 curl -sSL https://raw.githubusercontent.com/steveyegge/beads/main/scripts/install.sh | bash
-# If that requires root, download the binary directly instead:
-#   ARCH=$(uname -m); [ "$ARCH" = "aarch64" ] && ARCH="arm64"
-#   curl -L "https://github.com/dolthub/dolt/releases/latest/download/dolt-linux-$ARCH.tar.gz" | tar -xz -C /tmp
-#   cp /tmp/dolt-linux-$ARCH/bin/dolt ~/.local/bin/
 
-# 2. Initialize the local Dolt database from the checked-in issues.jsonl
-bd init --force --prefix zuban
+# 2. Install dolt, if it is not already on PATH
+ARCH=$(uname -m); [ "$ARCH" = "x86_64" ] && ARCH="amd64"; [ "$ARCH" = "aarch64" ] && ARCH="arm64"
+curl -fsSL "https://github.com/dolthub/dolt/releases/latest/download/dolt-linux-$ARCH.tar.gz" | tar -xz -C /tmp
+cp /tmp/dolt-linux-$ARCH/bin/dolt ~/.local/bin/
 
-# 3. Import existing issues
-bd import
+# 3. Start the beads server, then clone the issue database from the Dolt remote
+#    (refs/dolt/data on origin). Never use `bd init --force` here: it re-initializes
+#    over existing data.
+bd dolt start
+bd bootstrap --yes
 
 # 4. Verify
 bd list
 ```
 
-> Note: the Dolt database is runtime state (not in git). You must run `bd init` + `bd import`
-> on every fresh checkout or container. Export back with `bd export > .beads/issues.jsonl`
+> Note: the Dolt database is runtime state (not in git), in `.beads/dolt/`. `scripts/agent-start.sh`
+> runs step 3 automatically when it is missing. Export back with `bd export > .beads/issues.jsonl`
 > before committing.
 
 ## Setup
@@ -72,7 +75,7 @@ bash scripts/run_jedi_rename_tests.sh
 
 ## Multi-Agent Parallelism
 
-When multiple instances are running from the same checkout, see **[MULTI_AGENT.md](MULTI_AGENT.md)** for the full procedure. In brief: run `bash scripts/agent-start.sh` to bootstrap, claim with `bd update --claim`, isolate with `git worktree`, push via `work/<id>:jedi-compare` with a retry loop — never touch the shared checkout's local `jedi-compare`.
+When multiple instances are running in one environment, see **[MULTI_AGENT.md](MULTI_AGENT.md)** for the full procedure. In brief: run `bash scripts/agent-start.sh` in the primary checkout to claim one issue and get a worktree, work in that worktree, and land with `bash scripts/agent-land.sh`. Never edit files or commit in the primary checkout — it holds the shared beads server, and `agent-start.sh` only fast-forwards it.
 
 **Each agent works on exactly one issue, then stops.**
 
@@ -85,11 +88,12 @@ When multiple instances are running from the same checkout, see **[MULTI_AGENT.m
 > outside the markers to survive. The managed block's own text agrees this section wins:
 > *"Explicit user or orchestrator instructions override this Beads block."*
 
-- **Both sync paths are required, not either/or.** `bd dolt push` is configured and confirmed
-  working in this environment (verified 2026-09-12: it syncs via `refs/dolt/data` on the `origin`
-  git remote). This does **not** replace the `.beads/issues.jsonl` export — fresh checkouts
-  bootstrap from that file (`bd init --force && bd import`, see "Beads Setup" above), and it's
-  what keeps issue changes visible in normal PR diffs. Run both:
+- **Both sync paths are required, not either/or.** `bd dolt push` syncs the database via
+  `refs/dolt/data` on the `origin` git remote, and fresh checkouts clone it from there
+  (`bd bootstrap`, see "Beads Setup" above) — a fresh checkout is only as current as the last push.
+  The `.beads/issues.jsonl` export is still required: it's what keeps issue changes visible in
+  normal PR diffs, and bootstrap's fallback when there is no Dolt remote. `scripts/agent-land.sh`
+  runs both. By hand:
   ```bash
   bd dolt push
   bd export > .beads/issues.jsonl

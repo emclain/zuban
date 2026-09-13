@@ -1,9 +1,12 @@
 #!/usr/bin/env bash
 # agent-start.sh — Bootstrap a multi-agent session and claim one issue.
 #
-# Usage:
-#   cd /workspace/dev/zuban
+# Usage (from the primary checkout):
 #   bash scripts/agent-start.sh
+#
+# The primary checkout is a coordination hub that no agent edits. This script
+# fast-forwards it to origin/jedi-compare, makes sure the shared beads Dolt
+# server is running, claims one issue, and creates an isolated worktree for it.
 #
 # On success, prints the worktree path and the claimed issue id.
 # On "no work available", exits 0 with a message.
@@ -16,54 +19,34 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO_ROOT"
 
-# ── 1. Ensure bd is on PATH ───────────────────────────────────────────────────
-if ! command -v bd &>/dev/null; then
-  echo "bd not found — installing..."
-  if curl -sSL https://raw.githubusercontent.com/steveyegge/beads/main/scripts/install.sh | bash; then
-    echo "bd installed via install script."
-  else
-    echo "Install script failed, trying direct dolt binary download..."
-    ARCH=$(uname -m)
-    [ "$ARCH" = "aarch64" ] && ARCH="arm64"
-    curl -fsSL "https://github.com/dolthub/dolt/releases/latest/download/dolt-linux-${ARCH}.tar.gz" \
-      | tar -xz -C /tmp
-    mkdir -p "$HOME/.local/bin"
-    cp "/tmp/dolt-linux-${ARCH}/bin/dolt" "$HOME/.local/bin/bd"
-    chmod +x "$HOME/.local/bin/bd"
-    export PATH="$HOME/.local/bin:$PATH"
-    echo "bd installed to ~/.local/bin/bd"
-  fi
+GIT_DIR_ABS="$(git rev-parse --path-format=absolute --git-dir)"
+GIT_COMMON_ABS="$(git rev-parse --path-format=absolute --git-common-dir)"
+if [ "$GIT_DIR_ABS" != "$GIT_COMMON_ABS" ]; then
+  echo "ERROR: run agent-start.sh from the primary checkout, not a worktree." >&2
+  echo "  cd $(dirname "$GIT_COMMON_ABS") && bash scripts/agent-start.sh" >&2
+  exit 1
 fi
 
+# ── 1. Ensure required tools are on PATH ─────────────────────────────────────
 export PATH="$HOME/.local/bin:$PATH"
-
-if ! command -v bd &>/dev/null; then
-  echo "ERROR: bd still not found after installation attempt. Add ~/.local/bin to PATH." >&2
-  exit 1
-fi
-
-# ── 2. Ensure jq is available (needed for --json parsing) ────────────────────
-if ! command -v jq &>/dev/null; then
-  echo "ERROR: jq is not installed. Install it with: apt-get install -y jq" >&2
-  exit 1
-fi
-
-# ── 3. Ensure Rust/cargo is available ────────────────────────────────────────
 if ! command -v cargo &>/dev/null; then
   source "$HOME/.cargo/env" 2>/dev/null || true
 fi
-if ! command -v cargo &>/dev/null; then
-  echo "ERROR: cargo not found. Install Rust from https://rustup.rs" >&2
-  exit 1
-fi
+# dolt is needed alongside bd: bd runs the shared `dolt sql-server` from it.
+for tool in bd dolt jq cargo; do
+  if ! command -v "$tool" &>/dev/null; then
+    echo "ERROR: $tool not found on PATH. See 'Beads Setup' and 'Setup' in AGENTS.md." >&2
+    exit 1
+  fi
+done
 
-# ── 3b. Ensure zuban debug binary is built ───────────────────────────────────
+# ── 2. Ensure zuban debug binary is built ────────────────────────────────────
 if [ ! -f "$REPO_ROOT/target/debug/zuban" ]; then
   echo "Building zuban (first run, may take a few minutes)..."
   cargo build
 fi
 
-# ── 3c. Ensure jedi repo is checked out alongside ────────────────────────────
+# ── 3. Ensure jedi repo is checked out alongside ─────────────────────────────
 JEDI_DIR="$(cd "$REPO_ROOT/.." && pwd)/jedi"
 if [ ! -d "$JEDI_DIR" ]; then
   echo "Cloning jedi alongside zuban..."
@@ -75,24 +58,65 @@ if [ ! -d "$JEDI_DIR/.venv" ]; then
   "$JEDI_DIR/.venv/bin/pip" install -q -e "$JEDI_DIR/[testing]"
 fi
 
-# ── 4. Initialize beads if not already done ──────────────────────────────────
-if ! bd list &>/dev/null 2>&1; then
-  echo "Initializing beads database..."
-  bd init --force --prefix zuban
-  bd import
+# ── 4. Fast-forward the primary checkout ─────────────────────────────────────
+# Worktrees branch from origin/jedi-compare directly; this only keeps the hub's
+# scripts and .beads config current. It refuses rather than touch local work.
+echo "Fast-forwarding primary checkout to origin/jedi-compare..."
+git fetch origin jedi-compare
+if [ "$(git branch --show-current)" != "jedi-compare" ]; then
+  echo "ERROR: the primary checkout must stay on jedi-compare (it is on '$(git branch --show-current)')." >&2
+  exit 1
+fi
+if ! git diff --quiet --ignore-submodules || ! git diff --cached --quiet --ignore-submodules; then
+  echo "ERROR: the primary checkout has uncommitted changes. No agent should work in it;" >&2
+  echo "move that work to a worktree, then re-run." >&2
+  git status --short --untracked-files=no >&2
+  exit 1
+fi
+if ! git merge --ff-only origin/jedi-compare; then
+  echo "ERROR: the primary checkout could not fast-forward to origin/jedi-compare." >&2
+  echo "If another agent was starting at the same moment, re-run. Otherwise it has local" >&2
+  echo "commits or untracked files in the way; resolve that by hand." >&2
+  exit 1
 fi
 
-# ── 5. Pull latest ────────────────────────────────────────────────────────────
-echo "Pulling latest from origin/jedi-compare..."
-git pull origin jedi-compare
+# ── 5. Ensure the shared beads database is up ────────────────────────────────
+# Parallel agents need beads' server mode: embedded mode is documented as
+# single-writer. Every worktree resolves to this checkout's .beads/ through
+# git's common dir, so they all talk to the one server this checkout runs.
+if [ "$(jq -r .dolt_mode .beads/metadata.json)" != "server" ]; then
+  echo "ERROR: .beads/metadata.json is not in server mode; parallel agents need the shared Dolt server." >&2
+  echo "See 'Beads Database' in MULTI_AGENT.md." >&2
+  exit 1
+fi
+fresh_db=0
+[ -d .beads/dolt ] || fresh_db=1
+bd dolt start
+if [ "$fresh_db" -eq 1 ]; then
+  # Fresh checkout: clone the database from the Dolt remote. Needs the server
+  # up first, and unlike `bd init --force` it never deletes existing data.
+  echo "No beads database yet — bootstrapping..."
+  bd bootstrap --yes
+fi
 
 # ── 6. Claim one issue ───────────────────────────────────────────────────────
+# `bd update --claim` is idempotent for the same actor, and bd's default actor
+# is git user.name — shared by every agent in this environment. Without a
+# unique actor, every agent would "win" the same issue.
+export BEADS_ACTOR="agent-$(hostname)-$$"
+ready_json="$(bd ready --json --limit 10)"
 claimed=""
-for id in $(bd ready --json --limit 10 | jq -r '.[].id'); do
-  if bd update "$id" --claim 2>/dev/null; then
+for id in $(jq -r '.[].id' <<<"$ready_json"); do
+  if claim_err="$(bd update "$id" --claim 2>&1 >/dev/null)"; then
     claimed="$id"
     break
   fi
+  # Losing a claim race is expected; any other failure is not.
+  if [ "$(bd show "$id" --json | jq -r '.[0].status')" = "in_progress" ]; then
+    continue
+  fi
+  echo "ERROR: claiming $id failed: $claim_err" >&2
+  exit 1
 done
 
 if [ -z "$claimed" ]; then
@@ -119,22 +143,13 @@ git worktree add "$worktree" -b "work/$claimed" origin/jedi-compare
 echo "Initializing submodules in worktree..."
 git -C "$worktree" submodule update --init
 
-# Git worktrees also do NOT inherit .beads/ — copy config so bd in the worktree
-# connects to the same Dolt server as this checkout.
-echo "Bridging bd into worktree..."
-mkdir -p "$worktree/.beads"
-cp -f "$REPO_ROOT/.beads/config.yaml" "$worktree/.beads/"
-if [ -f "$REPO_ROOT/.beads/dolt-server.port" ]; then
-  cp -f "$REPO_ROOT/.beads/dolt-server.port" "$worktree/.beads/"
-fi
-
 echo "Worktree created at: $worktree_abs"
 
 # ── 8. Write .agent-env ──────────────────────────────────────────────────────
 cat > "$worktree/.agent-env" <<EOF
 export CLAIMED_ID=$claimed
-export BEADS_ACTOR="agent-$(hostname)-$$"
-export ZUBAN_TYPESHED=$REPO_ROOT/third_party/typeshed
+export BEADS_ACTOR="$BEADS_ACTOR"
+export ZUBAN_TYPESHED=$worktree_abs/third_party/typeshed
 export JEDI_DIR=$JEDI_DIR
 export CARGO_TARGET_DIR=$worktree_abs/target
 EOF

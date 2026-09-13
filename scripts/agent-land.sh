@@ -5,7 +5,7 @@
 #   bash scripts/agent-land.sh
 #
 # Reads CLAIMED_ID from the environment (source .agent-env first) or pass as $1.
-# Must be run from the worktree (not the main checkout).
+# Must be run from the worktree (not the primary checkout).
 
 set -euo pipefail
 
@@ -30,24 +30,49 @@ if [ -z "$claimed" ]; then
   exit 1
 fi
 
-git_common="$(git rev-parse --git-common-dir)"
-if [[ "$git_common" = /* ]]; then
-  MAIN_CHECKOUT="$(dirname "$git_common")"
-else
-  MAIN_CHECKOUT="$(git rev-parse --show-toplevel)"
+git_common="$(git rev-parse --path-format=absolute --git-common-dir)"
+if [ "$(git rev-parse --path-format=absolute --git-dir)" = "$git_common" ]; then
+  echo "ERROR: run agent-land.sh from the issue's worktree, not the primary checkout." >&2
+  exit 1
 fi
+MAIN_CHECKOUT="$(dirname "$git_common")"
 WORKTREE_ROOT="$(git rev-parse --show-toplevel)"
+cd "$WORKTREE_ROOT"
 
-_add_safe_dirs "$MAIN_CHECKOUT" "$WORKTREE_ROOT"
+if ! git -C "$MAIN_CHECKOUT" rev-parse --git-dir &>/dev/null; then
+  _add_safe_dirs "$MAIN_CHECKOUT"
+fi
 
-# Helper: run a bd command; refresh server port and retry once on failure.
-bd_run() {
-  if ! bd "$@" 2>/dev/null; then
-    echo "bd $* failed — refreshing server port from main checkout and retrying..."
-    if [ -f "$MAIN_CHECKOUT/.beads/dolt-server.port" ]; then
-      cp -f "$MAIN_CHECKOUT/.beads/dolt-server.port" "$WORKTREE_ROOT/.beads/dolt-server.port"
-    fi
-    bd "$@"
+# Merge origin/jedi-compare into this branch. .beads/issues.jsonl is only an
+# export of the shared beads database, so a conflict there is resolved by
+# exporting again. A conflict in any other file stops the landing.
+merge_origin() {
+  git fetch origin jedi-compare
+  if git merge origin/jedi-compare --no-edit; then
+    return 0
+  fi
+  local conflicted
+  conflicted="$(git diff --name-only --diff-filter=U)"
+  if [ "$conflicted" = ".beads/issues.jsonl" ]; then
+    echo "issues.jsonl conflict — re-exporting from the beads database..."
+    bd export > .beads/issues.jsonl
+    git add .beads/issues.jsonl
+    git commit --no-edit
+    return 0
+  fi
+  git merge --abort 2>/dev/null || true
+  echo "ERROR: merging origin/jedi-compare failed. Conflicted files:" >&2
+  echo "${conflicted:-(none — see git output above)}" >&2
+  echo "Resolve it here (git merge origin/jedi-compare), commit, and re-run agent-land.sh." >&2
+  exit 1
+}
+
+# Commit a fresh export of the shared database, if it differs from HEAD.
+commit_export() {
+  bd export > .beads/issues.jsonl
+  git add .beads/issues.jsonl
+  if ! git diff --cached --quiet -- .beads/issues.jsonl; then
+    git commit -m "bd sync: update issues.jsonl after $claimed"
   fi
 }
 
@@ -62,32 +87,41 @@ export CARGO_TARGET_DIR="$WORKTREE_ROOT/target"
 export CARGO_INCREMENTAL=0
 cargo test
 
-# ── 2. Close the issue ───────────────────────────────────────────────────────
-echo "=== Closing $claimed ==="
-bd_run close "$claimed"
-
-# ── 3. Push code to remote (retry loop handles concurrent instances) ─────────
+# ── 2. Push code to remote (retry loop handles concurrent instances) ─────────
+# The issue stays in_progress until the code is on origin, so a landing that
+# stops on a conflict never leaves a closed issue behind.
 echo "=== Pushing code ==="
-while true; do
-  git fetch origin jedi-compare
-  git merge origin/jedi-compare --no-edit
-  git push origin "work/$claimed:jedi-compare" && break
+merge_origin
+until git push origin "work/$claimed:jedi-compare"; do
   echo "Push rejected — another instance landed first, retrying..."
   sleep 1
+  merge_origin
 done
 
-# ── 4. Persist beads state ───────────────────────────────────────────────────
-echo "=== Persisting beads state ==="
-bd_run export > "$WORKTREE_ROOT/.beads/issues.jsonl"
-git add .beads/issues.jsonl
-git commit -m "bd sync: update issues.jsonl after $claimed"
+# ── 3. Close the issue ───────────────────────────────────────────────────────
+echo "=== Closing $claimed ==="
+bd close "$claimed"
 
-while true; do
-  git fetch origin jedi-compare
-  git merge origin/jedi-compare --no-edit
-  git push origin "work/$claimed:jedi-compare" && break
+# ── 4. Persist beads state ───────────────────────────────────────────────────
+# Both are required (see "Beads Database" in MULTI_AGENT.md): the jsonl export
+# for git, and bd dolt push for the Dolt history that `bd bootstrap` restores.
+echo "=== Persisting beads state ==="
+commit_export
+until git push origin "work/$claimed:jedi-compare"; do
   echo "Push rejected — retrying..."
   sleep 1
+  merge_origin
+  commit_export
+done
+
+dolt_pushed=0
+for attempt in 1 2 3; do
+  if bd dolt push; then
+    dolt_pushed=1
+    break
+  fi
+  echo "bd dolt push failed (attempt $attempt/3)."
+  sleep 2
 done
 
 # ── 5. Clean up worktree ─────────────────────────────────────────────────────
@@ -95,6 +129,13 @@ echo "=== Cleaning up ==="
 cd "$MAIN_CHECKOUT"
 git worktree remove --force "$WORKTREE_ROOT"
 git branch -d "work/$claimed"
+
+if [ "$dolt_pushed" -ne 1 ]; then
+  echo "" >&2
+  echo "ERROR: $claimed landed in git, but bd dolt push failed. Run it from $MAIN_CHECKOUT:" >&2
+  echo "  bd dolt push" >&2
+  exit 1
+fi
 
 echo ""
 echo "✓ $claimed landed successfully."
