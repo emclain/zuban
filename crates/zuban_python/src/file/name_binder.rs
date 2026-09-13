@@ -1314,7 +1314,7 @@ impl<'db> NameBinder<'db> {
                         NameBinderKind::Function { is_async: true } if is_yield_from => {
                             self.add_issue(n.index(), IssueKind::YieldFromInAsyncFunction)
                         }
-                        NameBinderKind::Function { .. } => (),
+                        NameBinderKind::Function { .. } | NameBinderKind::Lambda => (),
                         NameBinderKind::Comprehension => self.add_issue(
                             n.index(),
                             IssueKind::YieldOrYieldFromInsideComprehension { keyword },
@@ -1930,10 +1930,25 @@ impl std::ops::BitAnd for Truthiness {
                     in_type_checking_block: in_type_checking_block2,
                 },
             ) => Self::True {
-                in_type_checking_block: in_type_checking_block1 && in_type_checking_block2,
+                in_type_checking_block: in_type_checking_block1 || in_type_checking_block2,
             },
-            (Self::Unknown, _) | (_, Self::Unknown) => Self::Unknown,
-            _ => Self::False,
+            (Self::False, _) | (_, Self::False) => Self::False,
+            _ => Self::Unknown,
+        }
+    }
+}
+
+impl std::ops::BitOr for Truthiness {
+    type Output = Self;
+    fn bitor(self, rhs: Self) -> Self::Output {
+        match (&self, &rhs) {
+            (Self::True { .. }, Self::True { .. }) => Self::True {
+                in_type_checking_block: false,
+            },
+            (Self::True { .. }, _) => self,
+            (_, Self::True { .. }) => rhs,
+            (Self::False, Self::False) => self,
+            _ => Self::Unknown,
         }
     }
 }
@@ -1946,20 +1961,6 @@ impl Truthiness {
                 in_type_checking_block: false,
             },
             Self::Unknown => Self::Unknown,
-        }
-    }
-    fn or_else(self, callback: impl FnOnce() -> Truthiness) -> Truthiness {
-        match self {
-            Self::False => callback(),
-            Self::Unknown => {
-                let truthy = callback();
-                if matches!(truthy, Self::True { .. }) {
-                    truthy
-                } else {
-                    self
-                }
-            }
-            _ => self,
         }
     }
 }
@@ -2228,7 +2229,7 @@ pub fn is_expr_part_reachable_for_name_binder(
         ExpressionPart::Disjunction(disjunction) => {
             let (left, right) = disjunction.unpack();
             return is_expr_part_reachable_for_name_binder(settings, flags, left)
-                .or_else(|| is_expr_part_reachable_for_name_binder(settings, flags, right));
+                | is_expr_part_reachable_for_name_binder(settings, flags, right);
         }
         _ => (),
     }

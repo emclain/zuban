@@ -13,7 +13,7 @@ use lsp_types::{
     DocumentDiagnosticReport, DocumentDiagnosticReportResult, NotebookCell, NotebookCellKind,
     NotebookDocument, NotebookDocumentCellChange, NotebookDocumentChangeEvent,
     NotebookDocumentChangeTextContent, PartialResultParams, TextDocumentContentChangeEvent,
-    TextDocumentIdentifier, TextDocumentItem, Uri, VersionedNotebookDocumentIdentifier,
+    TextDocumentIdentifier, TextDocumentItem, Url, VersionedNotebookDocumentIdentifier,
     VersionedTextDocumentIdentifier, WorkDoneProgressParams,
     notification::{
         DidChangeNotebookDocument, DidChangeTextDocument, DidCloseTextDocument,
@@ -39,6 +39,8 @@ pub(crate) struct Project<'a> {
     roots: Vec<String>,
     root_dir_contains_symlink: bool,
     push_diagnostics: bool,
+    hierarchical_document_symbol_support: bool,
+    initialization_options: Option<Value>,
 }
 
 impl<'a> Project<'a> {
@@ -49,6 +51,8 @@ impl<'a> Project<'a> {
             roots: vec![],
             root_dir_contains_symlink: false,
             push_diagnostics: false,
+            hierarchical_document_symbol_support: true,
+            initialization_options: None,
         }
     }
 
@@ -64,6 +68,16 @@ impl<'a> Project<'a> {
 
     pub(crate) fn with_push_diagnostics(mut self) -> Self {
         self.push_diagnostics = true;
+        self
+    }
+
+    pub(crate) fn with_initialization_options(mut self, initialization_options: Value) -> Self {
+        self.initialization_options = Some(initialization_options);
+        self
+    }
+
+    pub(crate) fn without_hierarchical_document_symbol_support(mut self) -> Self {
+        self.hierarchical_document_symbol_support = false;
         self
     }
 
@@ -99,6 +113,8 @@ impl<'a> Project<'a> {
                 &roots.iter().map(|root| root.as_str()).collect::<Vec<_>>(),
                 client_encodings,
                 !self.push_diagnostics,
+                self.hierarchical_document_symbol_support,
+                self.initialization_options,
             ),
             version_incrementor: Default::default(),
         }
@@ -126,7 +142,7 @@ impl Drop for Server {
 }
 
 impl Server {
-    pub(crate) fn uri_from_rel_path(&self, rel_path: &str) -> Uri {
+    pub(crate) fn uri_from_rel_path(&self, rel_path: &str) -> Url {
         let path = join(&self.tmp_dir.path_for_uri(), rel_path);
         path_to_uri(&path)
     }
@@ -242,7 +258,7 @@ impl Server {
         )
     }
 
-    pub fn expect_publish_diagnostics_with_uri(&self) -> (Uri, Vec<String>) {
+    pub fn expect_publish_diagnostics_with_uri(&self) -> (Url, Vec<String>) {
         let publish = self.expect_notification::<lsp_types::notification::PublishDiagnostics>();
         (
             publish.uri,
@@ -290,7 +306,9 @@ impl Server {
         assert!(message.contains("Test Panic"), "{message}");
         // Check for traceback occurrence
         assert!(
-            message.contains("zubanls::server::GlobalState::event_loop"),
+            // The first is Rust 1.97.0+, while the other appears before
+            message.contains("<zubanls::server::GlobalState>::event_loop")
+                || message.contains("zubanls::server::GlobalState::event_loop"),
             "{message}"
         );
         assert!(
@@ -319,7 +337,7 @@ impl Server {
         self.open_in_memory_file_for_uri(self.doc_id(path).uri, code)
     }
 
-    pub fn open_in_memory_file_for_uri(&self, uri: lsp_types::Uri, code: &str) {
+    pub fn open_in_memory_file_for_uri(&self, uri: lsp_types::Url, code: &str) {
         self.notify::<DidOpenTextDocument>(DidOpenTextDocumentParams {
             text_document: TextDocumentItem {
                 uri,
@@ -336,11 +354,11 @@ impl Server {
         });
     }
 
-    fn notebook_uri(&self) -> Uri {
+    fn notebook_uri(&self) -> Url {
         self.uri_from_rel_path(NOTEBOOK_NAME)
     }
 
-    pub fn notebook_cell_uri(&self, nth: usize) -> Uri {
+    pub fn notebook_cell_uri(&self, nth: usize) -> Url {
         self.uri_from_rel_path(&format!("{NOTEBOOK_NAME}/{nth}"))
     }
 

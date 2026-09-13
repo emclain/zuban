@@ -1,9 +1,9 @@
 use std::{borrow::Cow, cell::Cell, fmt, sync::Arc};
 
 use parsa_python_cst::{
-    Decorated, Decorator, ExpressionContent, ExpressionPart, Param as CSTParam, ParamIterator,
-    ParamKind, PrimaryContent, PrimaryOrAtom, ReturnAnnotation, ReturnOrYield, TrivialBodyState,
-    YieldExprContent,
+    Decorated, Decorator, Expression, ExpressionContent, ExpressionPart, NameDef,
+    Param as CSTParam, ParamIterator, ParamKind, PrimaryContent, PrimaryOrAtom, ReturnAnnotation,
+    ReturnOrYield, TrivialBodyState, YieldExprContent,
 };
 
 use crate::{
@@ -160,13 +160,10 @@ impl<'db: 'a + 'class, 'a, 'class> Function<'a, 'class> {
     ) -> InferrableParamIterator<
         'db,
         'b,
-        impl Iterator<Item = FunctionParam<'b>>,
-        FunctionParam<'b>,
+        impl Iterator<Item = FunctionParam<'a>>,
+        FunctionParam<'a>,
         AI,
-    >
-    where
-        'a: 'b,
-    {
+    > {
         let mut params = self.iter_params();
         if skip_first_param {
             params.next();
@@ -265,7 +262,7 @@ impl<'db: 'a + 'class, 'a, 'class> Function<'a, 'class> {
                 // When an untyped method returns None, it typically means that a subclass will
                 // return None | Any.
                 *result = Inferred::from_type(Type::ERROR.union(Type::None))
-            } else if body_node_ref.point().specific() != Specific::FunctionEndIsUnreachable {
+            } else if body_node_ref.point().specific() == Specific::FunctionEndIsReachable {
                 // None can be an implicit return
                 *result = Inferred::from_type(result.as_type(i_s).union(Type::None))
             }
@@ -312,13 +309,67 @@ impl<'db: 'a + 'class, 'a, 'class> Function<'a, 'class> {
             .into_proper_type(i_s);
         if needs_async_remap {
             result = Inferred::from_type(new_class!(
-                i_s.db.python_state.coroutine_link(),
-                Type::Any(AnyCause::Todo),
-                Type::Any(AnyCause::Todo),
+                FuncNodeRef::coroutine_link_depending_on_mypy_compatibility(i_s.db),
+                Type::Any(AnyCause::AsyncCoroutine),
+                Type::Any(AnyCause::AsyncCoroutine),
                 result.as_type(i_s),
             ))
         }
         result.save_redirect(i_s, reference.file, reference.node_index)
+    }
+
+    pub(crate) fn ensure_func_diagnostics(self, db: &Database) -> Result<(), ()> {
+        let i_s = if let Some(cls) = &self.class {
+            InferenceState::from_class(db, cls)
+        } else {
+            InferenceState::new(db, self.node_ref.file)
+        };
+        self.node_ref
+            .file
+            .inference(&i_s)
+            .ensure_func_diagnostics(self)
+    }
+
+    pub(crate) fn ensure_body_diagnostics(&self, db: &Database) -> Result<(), ()> {
+        let i_s = if let Some(cls) = &self.class {
+            InferenceState::from_class(db, cls)
+        } else {
+            InferenceState::new(db, self.node_ref.file)
+        };
+        self.cache_func_from_diagnostics(&i_s);
+        self.node_ref
+            .file
+            .inference(&InferenceState::new(i_s.db, self.node_ref.file))
+            .ensure_calculated_function_body(*self)
+    }
+
+    pub fn ensure_checked_untyped_function_for_heuristics(&self, db: &Database) {
+        // This is specifically here to be called from heuristics to ensure that the names in an
+        // unchecked function are properly initialized. This typically happens with
+        // --no-check-untyped-defs, which is the mypy default.
+
+        let body = self.node().body();
+        let body_ref = NodeRef::new(self.file, body.index());
+        let point = body_ref.point();
+        if point.function_was_checked() {
+            debug!("Function {} is already checked", self.qualified_name(db));
+            return;
+        }
+        debug!(
+            "Ensure checked untyped function {}",
+            self.qualified_name(db)
+        );
+        let _indent = debug_indent();
+        FLOW_ANALYSIS.with(|fa| {
+            fa.with_new_func_frame_and_return_unreachable(db, || {
+                InferenceState::from_func(db, self).avoid_errors_within(|i_s| {
+                    self.file
+                        .inference(i_s)
+                        .calc_block_diagnostics(body, None, Some(self))
+                });
+            });
+            body_ref.set_point(point.set_checked_function());
+        })
     }
 
     pub fn parent_class(&self, db: &'db Database) -> Option<Class<'class>> {
@@ -500,6 +551,8 @@ impl<'db: 'a + 'class, 'a, 'class> Function<'a, 'class> {
         from_diagnostics: bool,
     ) {
         if !name_def.point().calculated() {
+            // I'm not sure if this is true, but we want to assert it at least for tests.
+            debug_assert!(!name_def.point().calculating());
             name_def.set_point(Point::new_calculating());
             if !from_diagnostics && self.needs_flow_analysis_for_decorators(i_s) {
                 name_def.set_point(Point::new_uncalculated());
@@ -629,7 +682,7 @@ impl<'db: 'a + 'class, 'a, 'class> Function<'a, 'class> {
                         );
                     }
                 } else {
-                    original_t.error_if_not_matches(
+                    original_t.error_if_not_assignable(
                         i_s,
                         &Inferred::from_type(redefinition_t.as_ref().clone()),
                         |issue| self.add_issue_for_declaration(i_s, issue),
@@ -727,7 +780,7 @@ impl<'db: 'a + 'class, 'a, 'class> Function<'a, 'class> {
             }
             _ => {
                 if let Some(original_func) = self.original_func_for_overload() {
-                    if let Some(ComplexPoint::FunctionOverload(o)) = original_func.maybe_complex() {
+                    if let Some(o) = original_func.maybe_overload() {
                         for c in o.functions.iter_functions() {
                             if c.defined_at == self.node_ref.as_link() {
                                 return c.kind.clone();
@@ -739,7 +792,7 @@ impl<'db: 'a + 'class, 'a, 'class> Function<'a, 'class> {
                             return implementation.callable.kind.clone();
                         }
                     }
-                    Function::new(original_func, self.class).kind(i_s)
+                    Function::new(*original_func, self.class).kind(i_s)
                 } else {
                     FunctionKind::Function {
                         had_first_self_or_class_annotation,
@@ -749,7 +802,7 @@ impl<'db: 'a + 'class, 'a, 'class> Function<'a, 'class> {
         }
     }
 
-    pub fn original_func_for_overload(&self) -> Option<NodeRef<'a>> {
+    pub fn original_func_for_overload(&self) -> Option<FuncNodeRef<'a>> {
         let is_ov_unreachable =
             |p: Point| p.maybe_specific() == Some(Specific::OverloadUnreachable);
         if is_ov_unreachable(self.node_ref.point()) {
@@ -767,7 +820,7 @@ impl<'db: 'a + 'class, 'a, 'class> Function<'a, 'class> {
                 }
             }
             debug_assert_ne!(pre_unreachable, current_index - NAME_TO_FUNCTION_DIFF);
-            Some(NodeRef::new(self.node_ref.file, pre_unreachable))
+            Some(FuncNodeRef::new(self.node_ref.file, pre_unreachable))
         } else {
             None
         }
@@ -1043,7 +1096,7 @@ impl<'db: 'a + 'class, 'a, 'class> Function<'a, 'class> {
         };
         if self.node_ref.file.flags(i_s.db).disallow_any_decorated {
             let t = inferred.as_cow_type(i_s);
-            if t.has_any(i_s) {
+            if t.has_any_but_not_from_coroutine(i_s.db) {
                 let got = (!matches!(t.as_ref(), Type::Any(_))).then(|| t.format_short(i_s.db));
                 NodeRef::new(self.node_ref.file, self.node().name().index())
                     .add_issue(i_s, IssueKind::UntypedFunctionAfterDecorator { got });
@@ -1187,6 +1240,10 @@ impl<'db: 'a + 'class, 'a, 'class> Function<'a, 'class> {
         }
     }
 
+    fn is_in_protocol(&self, db: &Database) -> bool {
+        self.class.map(|c| c.is_protocol(db)).unwrap_or(false)
+    }
+
     fn calculate_next_overload_items(
         &self,
         i_s: &InferenceState,
@@ -1204,7 +1261,7 @@ impl<'db: 'a + 'class, 'a, 'class> Function<'a, 'class> {
         let mut dataclass_transform = details.dataclass_transform;
         let should_error_out = Cell::new(false);
         let add_issue_for_decorators_in_wrong_positions = |func: &Function, is_first: bool| {
-            if !(in_stub && is_first) {
+            if !(in_stub && is_first) && !self.is_in_protocol(i_s.db) {
                 for decorator in func.node().maybe_decorated().unwrap().decorators().iter() {
                     let add = |kind| {
                         NodeRef::new(func.node_ref.file, decorator.index()).add_issue(
@@ -1225,7 +1282,7 @@ impl<'db: 'a + 'class, 'a, 'class> Function<'a, 'class> {
                 }
             }
         };
-        let mut add_func = |func: &Function, inf: Inferred, is_first: bool, is_override| {
+        let mut add_func = |func: &Function<'a, '_>, inf: Inferred, is_first: bool, is_override| {
             let base = inf.as_cow_type(i_s);
             if let Some(CallableLike::Callable(callable)) = base.maybe_callable(i_s) {
                 if callable.is_final || is_override {
@@ -1236,7 +1293,7 @@ impl<'db: 'a + 'class, 'a, 'class> Function<'a, 'class> {
                 } else {
                     has_non_abstract = true;
                 }
-                functions.push(callable)
+                functions.push((func.node_ref, callable))
             } else {
                 func.add_issue_onto_start_including_decorator(
                     i_s,
@@ -1406,18 +1463,23 @@ impl<'db: 'a + 'class, 'a, 'class> Function<'a, 'class> {
             return None;
         } else if implementation.is_none()
             && !in_stub
-            && self.class.map(|c| !c.is_protocol(i_s.db)).unwrap_or(true)
+            && !self.is_in_protocol(i_s.db)
             && !has_abstract
         {
             if i_s.db.mypy_compatible() {
-                name_def_node_ref(functions.first().unwrap().defined_at)
-                    .name_ref_of_name_def()
+                functions
+                    .first()
+                    .unwrap()
+                    .0
                     .add_issue_onto_start_including_decorator(
                         i_s,
                         IssueKind::OverloadImplementationNeeded,
                     );
             } else {
-                name_def_node_ref(functions.first().unwrap().defined_at)
+                functions
+                    .first()
+                    .unwrap()
+                    .0
                     .add_issue(i_s, IssueKind::OverloadImplementationNeeded);
             }
         }
@@ -1429,7 +1491,7 @@ impl<'db: 'a + 'class, 'a, 'class> Function<'a, 'class> {
         }
 
         let is_final = if in_stub {
-            functions.first().is_some_and(|f| f.is_final)
+            functions.first().is_some_and(|(_, f)| f.is_final)
         } else {
             implementation
                 .as_ref()
@@ -1442,7 +1504,7 @@ impl<'db: 'a + 'class, 'a, 'class> Function<'a, 'class> {
         Some(OverloadDefinition {
             functions: {
                 debug_assert!(functions.len() > 1);
-                FunctionOverload::new(functions.into_boxed_slice())
+                FunctionOverload::new(functions.into_iter().map(|(_, c)| c).collect())
             },
             implementation,
             is_final,
@@ -1457,8 +1519,7 @@ impl<'db: 'a + 'class, 'a, 'class> Function<'a, 'class> {
             && let Some(first_index) =
                 first_defined_name_of_multi_def(file, self.node().name().index())
             && let Some(func) = NodeRef::new(file, first_index).maybe_name_of_function()
-            && let Some(ComplexPoint::FunctionOverload(o)) =
-                NodeRef::new(self.node_ref.file, func.index()).maybe_complex()
+            && let Some(o) = FuncNodeRef::new(self.node_ref.file, func.index()).maybe_overload()
         {
             return Some(o);
         }
@@ -1474,10 +1535,10 @@ impl<'db: 'a + 'class, 'a, 'class> Function<'a, 'class> {
     pub fn is_abstract(&self) -> bool {
         match self.node_ref.maybe_complex() {
             Some(ComplexPoint::TypeInstance(Type::Callable(c))) => c.is_abstract,
-            Some(ComplexPoint::FunctionOverload(o)) => o.functions.is_abstract(),
+            Some(ComplexPoint::FunctionOverload(o)) => o.is_abstract(),
             _ => {
                 if let Some(overload) = self.maybe_part_of_unreachable_overload() {
-                    overload.functions.is_abstract()
+                    overload.is_abstract()
                 } else {
                     false
                 }
@@ -1580,7 +1641,7 @@ impl<'db: 'a + 'class, 'a, 'class> Function<'a, 'class> {
                     }
                 },
             )
-            .unwrap_or_else(|| t.clone())
+            .into_owned()
         };
         let return_type = as_type(&options.return_type);
         let type_vars = self.type_vars(i_s.db).clone();
@@ -2020,13 +2081,8 @@ impl<'db: 'a + 'class, 'a, 'class> Function<'a, 'class> {
                     i_s,
                     IssueKind::DoesNotReturnAValue(self.diagnostic_string().into()),
                 );
-                // Not sure why Mypy returns any here, but we probably shouldn't. See also
-                // discussion in Github #150
-                if i_s.db.mypy_compatible() {
-                    return Inferred::new_any_from_error();
-                }
             }
-        } else if self.is_async() {
+        } else if self.is_async() && result_context.is_unused() {
             let return_type = calculated_type_vars.into_return_type(
                 i_s,
                 &return_type,
@@ -2098,7 +2154,7 @@ impl<'db: 'a + 'class, 'a, 'class> Function<'a, 'class> {
         let CallableLike::Overload(overload) = first_t.maybe_callable(i_s)? else {
             return None;
         };
-        let funcs: Box<[_]> = overload
+        let funcs: Arc<[_]> = overload
             .iter_functions()
             .filter_map(|overload_callable| {
                 let had_errors = Cell::new(false);
@@ -2127,13 +2183,9 @@ impl<'db: 'a + 'class, 'a, 'class> Function<'a, 'class> {
                 (!had_errors.get()).then_some(c)
             })
             .collect();
-        if funcs.len() == 0 {
-            // No overload matched, therefore we can return
-            return None;
-        }
-        Some(Inferred::from_type(Type::FunctionOverload(
-            FunctionOverload::new(funcs),
-        )))
+        Some(Inferred::from_type(
+            CallableLike::from_overload_funcs(funcs)?.into(),
+        ))
     }
 
     pub fn diagnostic_string(&self) -> String {
@@ -2198,11 +2250,19 @@ pub(crate) struct AsCallableOptions<'a> {
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct FunctionParam<'x> {
-    file: &'x PythonFile,
+    pub file: &'x PythonFile,
     param: CSTParam<'x>,
 }
 
 impl<'db: 'x, 'x> FunctionParam<'x> {
+    pub fn name_def(&self) -> NameDef<'x> {
+        self.param.name_def()
+    }
+
+    pub fn default(&self) -> Option<Expression<'x>> {
+        self.param.default()
+    }
+
     fn annotation_or_any(&self, db: &'db Database) -> Cow<'x, Type> {
         self.annotation(db)
             .unwrap_or_else(|| Cow::Borrowed(&Type::Any(AnyCause::Unannotated)))
@@ -2472,7 +2532,7 @@ fn infer_decorator_details(
             InferredDecorator::DataclassTransform(transform.clone())
         }
         Some(ComplexPoint::TypeInstance(Type::Class(c)))
-            if Some(c.link) == i_s.db.python_state.deprecated_link() =>
+            if c.link == i_s.db.python_state.deprecated_link =>
         {
             let reason = inference.infer_deprecated_reason(decorator);
             InferredDecorator::Deprecated(reason)
@@ -2553,7 +2613,7 @@ impl GeneratorType {
                     return_type: None,
                 })
             }
-            Type::Class(c) if c.link == db.python_state.generator_link() => {
+            Type::Class(c) if db.python_state.is_generator(c.link) => {
                 let cls = c.class(db);
                 Some(GeneratorType {
                     yield_type: cls.nth_type_argument(db, 0),
@@ -2561,7 +2621,7 @@ impl GeneratorType {
                     return_type: Some(cls.nth_type_argument(db, 2)),
                 })
             }
-            Type::Class(c) if c.link == db.python_state.async_generator_link() => {
+            Type::Class(c) if db.python_state.is_async_generator(c.link) => {
                 let cls = c.class(db);
                 Some(GeneratorType {
                     yield_type: cls.nth_type_argument(db, 0),

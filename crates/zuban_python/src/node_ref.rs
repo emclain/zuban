@@ -1,7 +1,7 @@
-use std::fmt;
+use std::{fmt, marker::PhantomData};
 
 use parsa_python_cst::{
-    Annotation, Assignment, BytesLiteral, ClassDef, CodeIndex, Expression, FunctionDef, ImportFrom,
+    Annotation, BytesLiteral, ClassDef, CodeIndex, CstNode, Expression, FunctionDef, ImportFrom,
     ImportName, Int, NAME_DEF_TO_NAME_DIFFERENCE, Name, NameDef, NameDefParent, NameImportParent,
     NamedExpression, NodeIndex, Primary, PrimaryTarget, Scope, Slices, StarExpression,
     StarStarExpression, StarredExpression, StringLiteral,
@@ -113,7 +113,10 @@ impl<'file> NodeRef<'file> {
     pub fn accumulate_types(&self, i_s: &InferenceState, add: &Inferred) {
         let point = self.point();
         if point.calculated() {
-            if point.maybe_specific() == Some(Specific::Cycle) {
+            if matches!(
+                point.maybe_specific(),
+                Some(Specific::Cycle | Specific::UntypedFunctionSelfAssignment)
+            ) {
                 return;
             }
             let new = self.expect_inferred(i_s).simplified_union(i_s, add.clone());
@@ -199,14 +202,6 @@ impl<'file> NodeRef<'file> {
 
     pub fn expect_named_expression(&self) -> NamedExpression<'file> {
         NamedExpression::by_index(&self.file.tree, self.node_index)
-    }
-
-    pub fn expect_assignment(&self) -> Assignment<'file> {
-        Assignment::by_index(&self.file.tree, self.node_index)
-    }
-
-    pub fn expect_import_from(&self) -> ImportFrom<'file> {
-        ImportFrom::by_index(&self.file.tree, self.node_index)
     }
 
     pub fn expect_import_name(&self) -> ImportName<'file> {
@@ -495,5 +490,44 @@ impl fmt::Debug for NodeRef<'_> {
         s.field("file_index", &self.file.file_index);
         s.field("node_index", &self.node_index);
         s.finish()
+    }
+}
+
+pub(crate) struct KnownNodeRef<'file, N>(NodeRef<'file>, PhantomData<N>);
+
+impl<'file, N: CstNode<'file>> KnownNodeRef<'file, N> {
+    #[inline]
+    pub fn new(file: &'file PythonFile, node: N) -> Self {
+        Self(NodeRef::new(file, node.index()), PhantomData)
+    }
+
+    pub fn as_node(&self) -> N {
+        N::by_index(&self.file.tree, self.node_index)
+    }
+}
+
+impl<'file, N> std::ops::Deref for KnownNodeRef<'file, N> {
+    type Target = NodeRef<'file>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+pub(crate) struct KnownPointLink<N>(PointLink, PhantomData<N>);
+
+impl<'file, N: CstNode<'file>> KnownPointLink<N> {
+    #[inline]
+    pub fn new(file_index: FileIndex, node: N) -> Self {
+        Self(PointLink::new(file_index, node.index()), PhantomData)
+    }
+
+    pub fn as_node(&self, db: &'file Database) -> N {
+        let file = self.file(db);
+        N::by_index(&file.tree, self.0.node_index)
+    }
+
+    pub fn file(&self, db: &'file Database) -> &'file PythonFile {
+        db.loaded_python_file(self.0.file)
     }
 }

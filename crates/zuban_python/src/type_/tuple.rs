@@ -11,7 +11,7 @@ use num_bigint::BigInt;
 
 use super::{
     ClassGenerics, CustomBehavior, FormatStyle, GenericItem, GenericsList, LookupResult,
-    RecursiveType, TypeVarLikeUsage, TypeVarTupleUsage, utils::method_with_fallback,
+    TypeVarLikeUsage, TypeVarTupleUsage, utils::method_with_fallback,
 };
 use crate::{
     arguments::Args,
@@ -27,7 +27,7 @@ use crate::{
     result_context::ResultContext,
     type_::{AnyCause, Type},
     type_helpers::{Class, ClassExecutionResult, Instance, LookupDetails, TypeOrClass},
-    utils::{arc_slice_into_vec, join_with_commas},
+    utils::{arc_slice_into_vec, debug_indent, join_with_commas},
 };
 
 thread_local! {
@@ -89,12 +89,15 @@ impl Tuple {
     pub fn tuple_class_generics(&self, db: &Database) -> &GenericsList {
         debug_assert!(!self.currently_calculating_generics.load(Ordering::Relaxed));
         self.tuple_class_generics.get_or_init(|| {
+            debug!("Calculate tuple class generics");
+            let indent = debug_indent();
             self.currently_calculating_generics
                 .store(true, Ordering::Relaxed);
             let t = self
                 .args
                 .simplified_union_of_tuple_entries(&InferenceState::new_in_unknown_file(db))
                 .avoid_implicit_literal(db);
+            drop(indent);
             debug!("Calculated tuple class generics: {}", t.format_short(db));
             self.currently_calculating_generics
                 .store(false, Ordering::Relaxed);
@@ -136,16 +139,6 @@ impl Tuple {
                 before_index: 0,
                 after_index: 0,
             },
-        }
-    }
-
-    pub fn format_with_simplified_unpack(&self, format_data: &FormatData) -> Box<str> {
-        match &self.args {
-            TupleArgs::WithUnpack(w) if w.before.is_empty() && w.after.is_empty() => w
-                .unpack
-                .format(format_data)
-                .unwrap_or("Unpack[Never]".into()),
-            _ => format!("Unpack[{}]", self.format(format_data)).into(),
         }
     }
 
@@ -459,14 +452,6 @@ impl Tuple {
         }
     }
 
-    pub fn find_in_type(&self, db: &Database, check: &mut impl FnMut(&Type) -> bool) -> bool {
-        match &self.args {
-            TupleArgs::FixedLen(ts) => ts.iter().any(|t| t.find_in_type(db, check)),
-            TupleArgs::ArbitraryLen(t) => t.find_in_type(db, check),
-            TupleArgs::WithUnpack(with_unpack) => with_unpack.find_in_type(db, check),
-        }
-    }
-
     pub fn class<'db: 'a, 'a>(&'a self, db: &'db Database) -> Class<'a> {
         let generics = self.tuple_class_generics(db);
         Class::from_position(
@@ -509,7 +494,7 @@ impl TupleUnpack {
         }
     }
 
-    fn format(&self, format_data: &FormatData) -> Option<Box<str>> {
+    pub(super) fn format(&self, format_data: &FormatData) -> Option<Box<str>> {
         match self {
             Self::TypeVarTuple(t) => format_data.format_type_var_tuple(t),
             Self::ArbitraryLen(t) => {
@@ -554,24 +539,6 @@ impl WithUnpack {
             }
             || self.before.iter().any(|t| t.find_in_type(db, check))
     }
-
-    fn has_any_internal(
-        &self,
-        i_s: &InferenceState,
-        already_checked: &mut Vec<Arc<RecursiveType>>,
-    ) -> bool {
-        self.before
-            .iter()
-            .any(|t| t.has_any_internal(i_s, already_checked))
-            || match &self.unpack {
-                TupleUnpack::TypeVarTuple(_) => false,
-                TupleUnpack::ArbitraryLen(t) => t.has_any_internal(i_s, already_checked),
-            }
-            || self
-                .after
-                .iter()
-                .any(|t| t.has_any_internal(i_s, already_checked))
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -596,23 +563,15 @@ impl TupleArgs {
         }
     }
 
-    pub fn has_any(&self, i_s: &InferenceState) -> bool {
-        self.has_any_internal(i_s, &mut Vec::new())
-    }
-
     pub fn is_empty(&self) -> bool {
         matches!(self, TupleArgs::FixedLen(fixed) if fixed.is_empty())
     }
 
-    pub(super) fn has_any_internal(
-        &self,
-        i_s: &InferenceState,
-        already_checked: &mut Vec<Arc<RecursiveType>>,
-    ) -> bool {
+    pub fn find_in_type(&self, db: &Database, check: &mut impl FnMut(&Type) -> bool) -> bool {
         match self {
-            Self::FixedLen(ts) => ts.iter().any(|t| t.has_any_internal(i_s, already_checked)),
-            Self::ArbitraryLen(t) => t.has_any_internal(i_s, already_checked),
-            Self::WithUnpack(with_unpack) => with_unpack.has_any_internal(i_s, already_checked),
+            TupleArgs::FixedLen(ts) => ts.iter().any(|t| t.find_in_type(db, check)),
+            TupleArgs::ArbitraryLen(t) => t.find_in_type(db, check),
+            TupleArgs::WithUnpack(with_unpack) => with_unpack.find_in_type(db, check),
         }
     }
 
@@ -727,7 +686,7 @@ impl TupleArgs {
     }
 }
 
-pub trait MergableTypes: Deref<Target = [Type]> + Into<Arc<[Type]>> {
+pub(crate) trait MergableTypes: Deref<Target = [Type]> + Into<Arc<[Type]>> {
     fn into_iter_types(self) -> impl Iterator<Item = Type>;
     fn into_types_vec(self) -> Vec<Type>;
 }

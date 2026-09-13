@@ -12,6 +12,7 @@ mod operations;
 mod overlaps;
 mod recursive_type;
 mod replace;
+mod sentinel;
 mod tuple;
 mod type_var_likes;
 mod typed_dict;
@@ -32,9 +33,10 @@ use vfs::{Directory, FileIndex};
 
 pub(crate) use self::{
     callable::{
-        CallableContent, CallableParam, CallableParams, ParamType, ParamTypeDetails, StarParamType,
-        StarStarParamType, TypeGuardInfo, WrongPositionalCount, add_any_params_to_params,
-        add_param_spec_to_params, format_callable_params, format_params_as_param_spec,
+        CallableContent, CallableParam, CallableParams, ParamType, ParamTypeDetails,
+        PrettyCallableOptions, StarParamType, StarStarParamType, TypeGuardInfo,
+        WrongPositionalCount, add_any_params_to_params, add_param_spec_to_params,
+        format_callable_params, format_params_as_param_spec,
     },
     custom_behavior::CustomBehavior,
     dataclass::{
@@ -51,9 +53,10 @@ pub(crate) use self::{
     lookup_result::LookupResult,
     matching::{match_arbitrary_len_vs_unpack, match_tuple_type_arguments, match_unpack},
     named_tuple::NamedTuple,
-    operations::{IterCause, IterInfos, execute_type_of_type},
+    operations::{IterCause, IterInfos, LookupArgs, execute_type_of_type},
     recursive_type::{RecursiveType, RecursiveTypeOrigin},
     replace::{ReplaceSelf, ReplaceTypeVarLikes, replace_param_spec},
+    sentinel::Sentinel,
     tuple::{MaybeUnpackGatherer, Tuple, TupleArgs, TupleUnpack, WithUnpack, execute_tuple_class},
     type_var_likes::{
         CallableWithParent, ParamSpec, ParamSpecArg, ParamSpecTypeVars, ParamSpecUsage,
@@ -211,7 +214,7 @@ pub(crate) enum GenericItem {
 }
 
 impl GenericItem {
-    fn maybe_any(&self) -> Option<AnyCause> {
+    pub fn maybe_any(&self) -> Option<AnyCause> {
         match self {
             Self::TypeArg(Type::Any(cause)) => Some(*cause),
             Self::TypeArg(_) => None,
@@ -314,18 +317,6 @@ impl GenericsList {
     pub fn into_vec(self) -> Vec<GenericItem> {
         arc_slice_into_vec(self.0)
     }
-
-    fn has_any_internal(
-        &self,
-        i_s: &InferenceState,
-        already_checked: &mut Vec<Arc<RecursiveType>>,
-    ) -> bool {
-        self.iter().any(|g| match g {
-            GenericItem::TypeArg(t) => t.has_any_internal(i_s, already_checked),
-            GenericItem::TypeArgs(ts) => ts.args.has_any_internal(i_s, already_checked),
-            GenericItem::ParamSpecArg(a) => a.params.has_any_internal(i_s, already_checked),
-        })
-    }
 }
 
 impl std::ops::Index<TypeVarIndex> for GenericsList {
@@ -370,12 +361,12 @@ impl Hash for Namespace {
 impl std::cmp::Eq for Namespace {}
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub(crate) struct FunctionOverload(Box<[Arc<CallableContent>]>);
+pub(crate) struct FunctionOverload(Arc<[Arc<CallableContent>]>);
 
 impl FunctionOverload {
-    pub fn new(functions: Box<[Arc<CallableContent>]>) -> Arc<Self> {
+    pub fn new(functions: Arc<[Arc<CallableContent>]>) -> Self {
         debug_assert!(!functions.is_empty());
-        Arc::new(Self(functions))
+        Self(functions)
     }
 
     pub fn kind(&self) -> &FunctionKind {
@@ -503,7 +494,7 @@ pub(crate) enum Type {
     Class(GenericClass),
     Union(UnionType),
     Intersection(Intersection),
-    FunctionOverload(Arc<FunctionOverload>),
+    FunctionOverload(FunctionOverload),
     TypeVar(TypeVarUsage),
     Type(Arc<Type>),
     Tuple(Arc<Tuple>),
@@ -533,6 +524,7 @@ pub(crate) enum Type {
         implicit: bool,
     },
     TypeForm(Arc<Type>),
+    Sentinel(Sentinel),
     Any(AnyCause),
     Never(NeverCause),
 }
@@ -550,7 +542,7 @@ impl Type {
         might_have_defined_type_vars: bool,
     ) -> Self {
         match entries.len() {
-            0 => Type::Never(NeverCause::Other),
+            0 => Type::NEVER,
             1 => entries.into_iter().next().unwrap().type_,
             _ => {
                 let mut union = UnionType::new(entries, might_have_defined_type_vars);
@@ -669,6 +661,7 @@ impl Type {
                 .calculated_type_if_ready(db)
                 .is_none_or(|t| t.is_calculating(db)),
             Type::Union(u) => u.iter().any(|t| t.is_calculating(db)),
+            Type::Intersection(i) => i.iter_entries().any(|t| t.is_calculating(db)),
             _ => false,
         }
     }
@@ -686,6 +679,24 @@ impl Type {
             .any(|t| matches!(t, Type::Any(_)))
     }
 
+    pub fn maybe_remove_any(&self, db: &Database) -> Option<Self> {
+        if !self.is_any_or_any_in_union(db) {
+            return None;
+        }
+        let might_have_defined_type_vars = match self {
+            Type::Union(u) => u.might_have_type_vars,
+            Type::Any(_) => false,
+            _ => true,
+        };
+        Some(Type::from_union_entries(
+            self.iter_with_unpacked_union_entries(db, true)
+                .filter(|e| !matches!(e.type_, Type::Any(_)))
+                .map(|e| e.into())
+                .collect(),
+            might_have_defined_type_vars,
+        ))
+    }
+
     pub fn is_type_of_any(&self) -> bool {
         match self {
             Type::Type(t) => t.is_any(),
@@ -701,6 +712,22 @@ impl Type {
     pub fn is_object(&self, db: &Database) -> bool {
         match self {
             Self::Class(c) => c.link == db.python_state.object_link(),
+            _ => false,
+        }
+    }
+
+    pub fn is_final(&self, db: &Database) -> bool {
+        match self {
+            Type::Class(c) => c.class(db).use_cached_class_infos(db).is_final,
+            Type::Dataclass(d) => d.class(db).use_cached_class_infos(db).is_final,
+            Type::Enum(_) | Type::EnumMember(_) => true, // Enums are always final
+            _ => false,
+        }
+    }
+
+    pub fn is_metaclass(&self, db: &Database) -> bool {
+        match self {
+            Type::Class(c) => c.class(db).is_metaclass(db),
             _ => false,
         }
     }
@@ -878,6 +905,8 @@ impl Type {
                 _ => return None,
             },
             Type::TypedDict(_) => db.python_state.typed_dict_class(),
+            Type::Callable(_) | Type::FunctionOverload(_) => db.python_state.function_class(),
+            Type::RecursiveType(r) => return r.calculated_type(db).inner_generic_class_with_db(db),
             Type::NewType(n) => return n.type_.inner_generic_class_with_db(db),
             _ => return None,
         })
@@ -901,6 +930,22 @@ impl Type {
     }
 
     pub fn maybe_callable(&self, i_s: &InferenceState) -> Option<CallableLike> {
+        let check_class = |cls: Class| {
+            let had_issue = Cell::new(false);
+            cls.instance()
+                .type_lookup(
+                    i_s,
+                    |issue| {
+                        debug!("Caught issue: {issue:?}");
+                        had_issue.set(true);
+                        false
+                    },
+                    "__call__",
+                )
+                .into_maybe_inferred()
+                .filter(|_| !had_issue.get())
+                .and_then(|i| i.as_cow_type(i_s).maybe_callable(i_s))
+        };
         match self {
             Type::Callable(c) => Some(CallableLike::Callable(c.clone())),
             Type::Type(t) => t.type_type_maybe_callable(i_s),
@@ -908,28 +953,19 @@ impl Type {
                 i_s.db.python_state.empty_type_var_likes.clone(),
                 *cause,
             )))),
-            Type::Class(c) => {
-                let cls = c.class(i_s.db);
-                let had_issue = Cell::new(false);
-                Instance::new(cls, None)
-                    .type_lookup(
-                        i_s,
-                        |issue| {
-                            debug!("Caught issue: {issue:?}");
-                            had_issue.set(true);
-                            false
-                        },
-                        "__call__",
-                    )
-                    .into_maybe_inferred()
-                    .filter(|_| !had_issue.get())
-                    .and_then(|i| i.as_cow_type(i_s).maybe_callable(i_s))
-            }
+            Type::Class(c) => check_class(c.class(i_s.db)),
             Type::FunctionOverload(overload) => Some(CallableLike::Overload(overload.clone())),
             Type::TypeVar(t) => match t.type_var.kind(i_s.db) {
                 TypeVarKind::Bound(bound) => bound.maybe_callable(i_s),
                 _ => None,
             },
+            Type::CustomBehavior(_) => Some(CallableLike::Callable(
+                // TODO this should not be Any
+                i_s.db.python_state.any_callable_from_error.clone(),
+            )),
+            Type::Dataclass(dc) => check_class(dc.class(i_s.db)),
+            Type::Enum(e) => check_class(e.class(i_s.db)),
+            Type::EnumMember(e) => check_class(e.enum_.class(i_s.db)),
             _ => None,
         }
     }
@@ -953,7 +989,8 @@ impl Type {
             Type::Class(c) => cls_callable(c.class(i_s.db)),
             Type::Dataclass(d) => {
                 let cls = d.class(i_s.db);
-                if d.options.init {
+                // A dataclass cannot generate __init__ or overwrite it in its class body
+                if d.options.init && cls.lookup_symbol(i_s, "__init__").is_none() {
                     let mut init = dataclass_init_func(d, i_s.db).clone();
                     if d.class.generics != ClassGenerics::NotDefinedYet
                         || cls.use_cached_type_vars(i_s.db).is_empty()
@@ -998,6 +1035,34 @@ impl Type {
                     ),
                 )))
             }
+            Type::NewType(nt) => Some({
+                let mut result = nt.type_.type_type_maybe_callable(i_s)?;
+                let map_callable = |c: &Arc<CallableContent>| {
+                    let mut new = c.as_ref().clone();
+                    new.return_type = Type::NewType(nt.clone());
+                    Arc::new(new)
+                };
+                match &mut result {
+                    CallableLike::Callable(c) => *c = map_callable(c),
+                    CallableLike::Overload(o) => {
+                        *o = FunctionOverload::new(o.iter_functions().map(map_callable).collect())
+                    }
+                }
+                result
+            }),
+            Type::Enum(enum_) => Some({
+                CallableLike::Callable(Arc::new(CallableContent::new_non_generic(
+                    i_s.db,
+                    None,
+                    None,
+                    enum_.defined_at,
+                    [CallableParam::new(
+                        DbString::Static("value"),
+                        ParamType::PositionalOrKeyword(Type::Any(AnyCause::Internal)),
+                    )],
+                    self.clone(),
+                )))
+            }),
             _ => None,
         }
     }
@@ -1195,7 +1260,8 @@ impl Type {
             Self::CustomBehavior(_) => "TODO custombehavior".into(),
             Self::DataclassTransformObj(_) => "TODO dataclass_transform".into(),
             Self::LiteralString { .. } => "LiteralString".into(),
-            Self::TypeForm(t) => format!("typing.TypeForm({})", t.format(format_data)).into(),
+            Self::TypeForm(t) => format!("TypeForm[{}]", t.format(format_data)).into(),
+            Self::Sentinel(s) => s.format(format_data),
         }
     }
 
@@ -1233,6 +1299,7 @@ impl Type {
             | Self::Enum(_)
             | Self::EnumMember(_)
             | Self::NewType(_)
+            | Self::Sentinel(_)
             | Self::LiteralString { .. } => (),
             Self::RecursiveType(rec) => {
                 if let Some(generics) = rec.generics.as_ref() {
@@ -1269,59 +1336,68 @@ impl Type {
         result
     }
 
-    pub fn has_any(&self, i_s: &InferenceState) -> bool {
-        self.has_any_internal(i_s, &mut Vec::new())
+    pub fn has_any(&self, db: &Database) -> bool {
+        self.has_any_internal(db, &mut Vec::new(), &|_| true)
     }
 
-    fn has_any_internal(
+    pub fn has_any_internal(
         &self,
-        i_s: &InferenceState,
+        db: &Database,
         already_checked: &mut Vec<Arc<RecursiveType>>,
+        recheck: &impl Fn(AnyCause) -> bool,
     ) -> bool {
-        let mut search_in_generic_class = |c: &GenericClass| match &c.generics {
-            ClassGenerics::List(generics) => generics.has_any_internal(i_s, already_checked),
+        let has_any_callable_params = |list: &GenericsList| {
+            list.iter().any(|generic| match generic {
+                GenericItem::ParamSpecArg(ParamSpecArg {
+                    params: CallableParams::Any(cause),
+                    ..
+                }) => recheck(*cause),
+                _ => false,
+            })
+        };
+        let has_any_callable_params_in_generics = |generics: &_| match generics {
+            ClassGenerics::List(list) => has_any_callable_params(list),
             _ => false,
         };
-        match self {
-            Self::Class(c) => search_in_generic_class(c),
-            Self::Union(u) => u.iter().any(|t| t.has_any_internal(i_s, already_checked)),
-            Self::FunctionOverload(intersection) => intersection
-                .iter_functions()
-                .any(|callable| callable.has_any_internal(i_s, already_checked)),
-            Self::Type(type_) => type_.has_any_internal(i_s, already_checked),
-            Self::Tuple(content) => content.args.has_any_internal(i_s, already_checked),
-            Self::Callable(content) => content.has_any_internal(i_s, already_checked),
-            Self::Any(_) => true,
-            Self::NewType(n) => n.type_.has_any_internal(i_s, already_checked),
-            Self::RecursiveType(recursive_alias) => {
-                if let Some(generics) = &recursive_alias.generics
-                    && generics.has_any_internal(i_s, already_checked)
+        self.find_in_type(db, &mut |t| match t {
+            Self::Any(cause) => recheck(*cause),
+            Self::RecursiveType(recursive) => {
+                if let Some(generics) = &recursive.generics
+                    && has_any_callable_params(generics)
                 {
                     return true;
                 }
-                if already_checked.contains(recursive_alias) {
+                if already_checked.contains(recursive) {
                     false
                 } else {
-                    already_checked.push(recursive_alias.clone());
-                    match recursive_alias.origin(i_s.db) {
+                    already_checked.push(recursive.clone());
+                    match recursive.origin(db) {
                         RecursiveTypeOrigin::TypeAlias(type_alias) => {
                             !type_alias.calculating()
-                                && type_alias
-                                    .type_if_valid()
-                                    .has_any_internal(i_s, already_checked)
+                                && type_alias.type_if_valid().has_any_internal(
+                                    db,
+                                    already_checked,
+                                    recheck,
+                                )
                         }
                         RecursiveTypeOrigin::Class(_) => false,
                     }
                 }
             }
-            Self::Self_ => {
-                debug!("TODO Self could contain Any?");
-                false
-            }
-            Self::TypeVar(tv) => match &tv.type_var.kind(i_s.db) {
-                TypeVarKind::Bound(bound) => bound.has_any_internal(i_s, already_checked),
-                TypeVarKind::Unrestricted | TypeVarKind::Constraints(_) => false,
+            Self::NewType(n) => n.type_.has_any_internal(db, already_checked, recheck),
+            Self::Callable(c) => matches!(c.params, CallableParams::Any(cause) if recheck(cause)),
+
+            Self::Class(c) => has_any_callable_params_in_generics(&c.generics),
+            Self::Dataclass(d) => has_any_callable_params_in_generics(&d.class.generics),
+            Self::TypedDict(td) => match &td.generics {
+                TypedDictGenerics::Generics(list) => has_any_callable_params(list),
+                _ => false,
             },
+            // This is a special case for the experimental advanced function return inference mode
+            Self::TypeVar(tv) => tv.type_var.is_untyped() && recheck(AnyCause::Unannotated),
+
+            // All the other types are are either not Any or inner types will be checked by the
+            // recursive nature of find_types.
             Self::None
             | Self::Never(_)
             | Self::Literal { .. }
@@ -1334,15 +1410,17 @@ impl Type {
             | Self::EnumMember(_)
             | Self::Super { .. }
             | Self::Namespace(_)
-            | Self::LiteralString { .. } => false,
-            Self::Dataclass(d) => search_in_generic_class(&d.class),
-            Self::TypedDict(d) => d.has_any_internal(i_s, already_checked),
-            Self::NamedTuple(nt) => nt.__new__.has_any_internal(i_s, already_checked),
-            Self::Intersection(intersection) => intersection
-                .iter_entries()
-                .any(|t| t.has_any_internal(i_s, already_checked)),
-            Self::TypeForm(tf) => tf.has_any_internal(i_s, already_checked),
-        }
+            | Self::Sentinel(_)
+            | Self::LiteralString { .. }
+            | Self::Union(_)
+            | Self::Intersection(_)
+            | Self::FunctionOverload(_)
+            | Self::Type(_)
+            | Self::Tuple(_)
+            | Self::NamedTuple(_)
+            | Self::Self_
+            | Self::TypeForm(_) => false,
+        })
     }
 
     pub fn has_self_type(&self, db: &Database) -> bool {
@@ -1353,48 +1431,63 @@ impl Type {
         if check(self) {
             return true;
         }
+        let mut search_in_generic_class = |c: &GenericClass| {
+            Generics::from_class_generics(db, ClassNodeRef::from_link(db, c.link), &c.generics)
+                .iter(db)
+                .any(|generic| generic.find_in_type(db, check))
+        };
+
         match self {
-            Self::Class(c) => {
-                Generics::from_class_generics(db, ClassNodeRef::from_link(db, c.link), &c.generics)
-                    .iter(db)
-                    .any(|generic| generic.find_in_type(db, check))
-            }
+            Self::Class(c) => search_in_generic_class(c),
+            Self::Dataclass(d) => search_in_generic_class(&d.class),
             Self::Union(u) => u.iter().any(|t| t.find_in_type(db, check)),
-            Self::FunctionOverload(intersection) => intersection
-                .iter_functions()
-                .any(|c| c.find_in_type(db, check)),
+            Self::FunctionOverload(o) => o.iter_functions().any(|c| c.find_in_type(db, check)),
             Self::Type(t) => t.find_in_type(db, check),
-            Self::Tuple(tup) => tup.find_in_type(db, check),
+            Self::Tuple(tup) => tup.args.find_in_type(db, check),
             Self::Callable(content) => content.find_in_type(db, check),
-            Self::TypedDict(d) => match &d.generics {
-                TypedDictGenerics::Generics(gs) => {
-                    gs.iter().any(|g| Generic::new(g).find_in_type(db, check))
-                }
-                TypedDictGenerics::None | TypedDictGenerics::NotDefinedYet(_) => false,
+            Self::RecursiveType(recursive) => match &recursive.generics {
+                Some(gs) => gs.iter().any(|g| Generic::new(g).find_in_type(db, check)),
+                None => false,
             },
+            Self::TypedDict(d) => {
+                (match &d.generics {
+                    TypedDictGenerics::Generics(gs) => {
+                        gs.iter().any(|g| Generic::new(g).find_in_type(db, check))
+                    }
+                    TypedDictGenerics::None | TypedDictGenerics::NotDefinedYet(_) => false,
+                }) || {
+                    let Ok(members) = d.members_if_ready(db) else {
+                        // This is a bit unfortunate, but TypedDicts can be unfinished
+                        return false;
+                    };
+                    if let Some(extra) = &members.extra_items
+                        && extra.t.find_in_type(db, check)
+                    {
+                        return true;
+                    }
+                    members
+                        .named
+                        .iter()
+                        .any(|t| t.type_.find_in_type(db, check))
+                }
+            }
+            Self::Intersection(intersection) => intersection
+                .iter_entries()
+                .any(|t| t.find_in_type(db, check)),
+            Self::TypeForm(tf) => tf.find_in_type(db, check),
             _ => false,
         }
     }
 
     pub fn has_any_with_unknown_type_params(&self, db: &Database) -> bool {
-        self.find_in_type(db, &mut |t| match t {
-            Type::Any(AnyCause::UnknownTypeParam) => true,
-            Type::Callable(c) => {
-                matches!(c.params, CallableParams::Any(AnyCause::UnknownTypeParam))
-            }
-            Type::Class(c) => match &c.generics {
-                ClassGenerics::List(list) => list.iter().any(|g| {
-                    matches!(
-                        g,
-                        GenericItem::ParamSpecArg(ParamSpecArg {
-                            params: CallableParams::Any(AnyCause::UnknownTypeParam),
-                            ..
-                        })
-                    )
-                }),
-                _ => false,
-            },
-            _ => false,
+        self.has_any_internal(db, &mut Vec::new(), &|cause| {
+            cause == AnyCause::UnknownTypeParam
+        })
+    }
+
+    pub fn has_any_but_not_from_coroutine(&self, db: &Database) -> bool {
+        self.has_any_internal(db, &mut Vec::new(), &|cause| {
+            cause != AnyCause::AsyncCoroutine
         })
     }
 
@@ -1593,14 +1686,14 @@ impl Type {
             })
     }
 
-    pub(crate) fn error_if_not_matches(
+    pub(crate) fn error_if_not_assignable(
         &self,
         i_s: &InferenceState,
         value: &Inferred,
         add_issue: impl Fn(IssueKind) -> bool,
         mut on_error: impl FnMut(&ErrorTypes) -> Option<IssueKind>,
     ) {
-        self.error_if_not_matches_with_matcher(
+        self.error_if_not_assignable_with_matcher(
             i_s,
             &mut Matcher::default(),
             value,
@@ -1609,7 +1702,7 @@ impl Type {
         );
     }
 
-    pub(crate) fn error_if_not_matches_with_matcher(
+    pub(crate) fn error_if_not_assignable_with_matcher(
         &self,
         i_s: &InferenceState,
         matcher: &mut Matcher,
@@ -1618,10 +1711,10 @@ impl Type {
         on_error: impl FnMut(&ErrorTypes, &MismatchReason) -> Option<IssueKind>,
     ) {
         let value_type = value.as_cow_type(i_s);
-        self.error_if_t_not_matches_with_matcher(i_s, matcher, &value_type, add_issue, on_error);
+        self.error_if_t_not_assignable_with_matcher(i_s, matcher, &value_type, add_issue, on_error);
     }
 
-    pub(crate) fn error_if_t_not_matches_with_matcher(
+    pub(crate) fn error_if_t_not_assignable_with_matcher(
         &self,
         i_s: &InferenceState,
         matcher: &mut Matcher,
@@ -1884,10 +1977,14 @@ impl Type {
         return_type: impl FnOnce() -> Type,
     ) -> Self {
         if is_async {
-            new_class!(db.python_state.async_generator_link(), self, Type::None,)
+            new_class!(
+                db.python_state.async_generator_type_link(),
+                self,
+                Type::None,
+            )
         } else {
             new_class!(
-                db.python_state.generator_link(),
+                db.python_state.generator_type_link(),
                 self,
                 Type::None,
                 return_type()
@@ -2198,10 +2295,18 @@ impl Literal {
 #[derive(Debug, PartialEq, Eq, Hash)]
 pub(crate) enum CallableLike {
     Callable(Arc<CallableContent>),
-    Overload(Arc<FunctionOverload>),
+    Overload(FunctionOverload),
 }
 
 impl CallableLike {
+    pub fn from_overload_funcs(funcs: Arc<[Arc<CallableContent>]>) -> Option<Self> {
+        Some(match funcs.len() {
+            0 => return None,
+            1 => Self::Callable(funcs.iter().next().unwrap().clone()),
+            _ => Self::Overload(FunctionOverload::new(funcs)),
+        })
+    }
+
     pub fn format(&self, format_data: &FormatData) -> String {
         match self {
             Self::Callable(c) => c.format(format_data),
@@ -2263,6 +2368,7 @@ pub(crate) enum AnyCause {
     Internal,
     UnknownTypeParam,
     UntypedDecorator,
+    AsyncCoroutine,
     Todo, // Used for cases where it's currently unclear what the cause should be.
 }
 

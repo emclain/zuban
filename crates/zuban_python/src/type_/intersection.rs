@@ -1,9 +1,12 @@
-use std::{cell::Cell, sync::Arc};
+use std::{
+    cell::{Cell, RefCell},
+    sync::Arc,
+};
 
 use crate::{
     arguments::Args,
     diagnostics::IssueKind,
-    file::{check_multiple_inheritance, linearize_mro_and_return_linearizable},
+    file::{check_multiple_inheritance, linearize_mro},
     format_data::FormatData,
     getitem::SliceType,
     inference_state::InferenceState,
@@ -44,7 +47,7 @@ impl Intersection {
         i_s: &InferenceState,
         t1: &Type,
         t2: &Type,
-        add_issue: &mut dyn FnMut(IssueKind) -> bool,
+        mut add_issue: &mut dyn FnMut(IssueKind) -> bool,
     ) -> Result<Type, ()> {
         let mut handle_union = |union: &UnionType, other: &Type| {
             let mut found_issues = vec![];
@@ -85,18 +88,26 @@ impl Intersection {
             (Type::Union(u), _) => return handle_union(u, t2),
             (_, Type::Union(u)) => return handle_union(u, t1),
             (Type::Self_, _) => {
+                let Some(cls) = i_s.current_class() else {
+                    tracing::error!("Missing current class when trying to intersect (1)");
+                    return Ok(Type::ERROR);
+                };
                 return Intersection::new_instance_intersection(
                     i_s,
-                    &i_s.current_class().unwrap().as_type(i_s.db),
+                    &cls.as_type(i_s.db),
                     t2,
                     add_issue,
                 );
             }
             (_, Type::Self_) => {
+                let Some(cls) = i_s.current_class() else {
+                    tracing::error!("Missing current class when trying to intersect (2)");
+                    return Ok(Type::ERROR);
+                };
                 return Intersection::new_instance_intersection(
                     i_s,
                     t1,
-                    &i_s.current_class().unwrap().as_type(i_s.db),
+                    &cls.as_type(i_s.db),
                     add_issue,
                 );
             }
@@ -146,12 +157,13 @@ impl Intersection {
                 .into()
         };
         for t in intersection.iter_entries() {
-            if let Some(cls) = t.maybe_class(i_s.db)
-                && cls.use_cached_class_infos(i_s.db).is_final
-            {
+            if t.is_final(i_s.db) {
                 add_issue(IssueKind::IntersectionCannotExistDueToFinalClass {
                     intersection: fmt_intersection(&intersection),
-                    final_class: cls.name().into(),
+                    final_class: match t {
+                        Type::Class(c) => c.class(i_s.db).name().into(),
+                        _ => t.format_short(i_s.db),
+                    },
                 });
                 had_issue = true;
             }
@@ -160,6 +172,26 @@ impl Intersection {
             return Err(());
         }
 
+        let mut check = |entries| {
+            let add_issue = RefCell::new(&mut add_issue);
+            linearize_mro(
+                i_s.db,
+                entries,
+                || {
+                    add_issue.borrow_mut()(IssueKind::IntersectionCannotExistDueToDisjointBases {
+                        intersection: fmt_intersection(&intersection),
+                    });
+                },
+                || {
+                    add_issue.borrow_mut()(
+                        IssueKind::IntersectionCannotExistDueToInconsistentMro {
+                            intersection: fmt_intersection(&intersection),
+                        },
+                    );
+                },
+            )
+            .is_valid
+        };
         let linearizable = if intersection
             .entries
             .iter()
@@ -173,15 +205,12 @@ impl Intersection {
                 .filter(|t| !matches!(t, Type::Callable(_)))
                 .cloned()
                 .collect();
-            linearize_mro_and_return_linearizable(i_s.db, &check_entries).1
+            check(&check_entries)
         } else {
-            linearize_mro_and_return_linearizable(i_s.db, &intersection.entries).1
+            check(&intersection.entries)
         };
 
         if !linearizable {
-            add_issue(IssueKind::IntersectionCannotExistDueToInconsistentMro {
-                intersection: fmt_intersection(&intersection),
-            });
             return Err(());
         }
 

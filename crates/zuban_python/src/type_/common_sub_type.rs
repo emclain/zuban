@@ -1,22 +1,38 @@
 use std::sync::Arc;
 
 use parsa_python_cst::ParamKind;
+use utils::FastHashSet;
 
 use super::{
     AnyCause, CallableContent, CallableLike, CallableParam, CallableParams, ParamType,
-    StarParamType, StarStarParamType, Type, TypeGuardInfo, UnionType,
+    StarParamType, StarStarParamType, Type, TypeGuardInfo,
 };
 use crate::{
     debug,
     inference_state::InferenceState,
     type_::{self, Tuple, TupleArgs, TupleUnpack},
+    utils::debug_indent,
 };
 
 impl Type {
     pub fn common_sub_type(&self, i_s: &InferenceState, other: &Self) -> Option<Type> {
+        let x = self.common_sub_type_part2(i_s, other)?;
+        if x.is_never() {
+            return None;
+        }
+        Some(x)
+    }
+
+    fn common_sub_type_part2(&self, i_s: &InferenceState, other: &Self) -> Option<Type> {
+        debug!(
+            "Find common subtype for {} and {}",
+            self.format_short(i_s.db),
+            other.format_short(i_s.db)
+        );
+        let _indent = debug_indent();
         match (self, other) {
-            (Type::Union(union), _) => common_sub_type_for_union(i_s, union, other),
-            (_, Type::Union(union)) => common_sub_type_for_union(i_s, union, self),
+            (Type::Union(union), _) => common_sub_type_for_union(i_s, union.iter(), other),
+            (_, Type::Union(union)) => common_sub_type_for_union(i_s, union.iter(), self),
             (Type::Tuple(tup1), Type::Tuple(tup2)) => Some(Type::Tuple(Tuple::new(
                 tup1.args.common_sub_type(i_s, &tup2.args)?,
             ))),
@@ -34,6 +50,9 @@ impl Type {
                 } else {
                     Some(Type::Type(Arc::new(new)))
                 }
+            }
+            (Type::TypeForm(t1), Type::TypeForm(t2)) => {
+                Some(Type::TypeForm(Arc::new(t1.common_sub_type(i_s, t2)?)))
             }
             _ => {
                 if self.is_simple_sub_type_of(i_s, other).bool() {
@@ -236,20 +255,48 @@ fn common_sub_type_for_guard(
     None
 }
 
-fn common_sub_type_for_union(
+fn common_sub_type_for_union<'x>(
     i_s: &InferenceState,
-    union: &UnionType,
+    union: impl IntoIterator<Item = &'x Type>,
     other: &Type,
 ) -> Option<Type> {
-    let mut result: Option<Type> = None;
-    for t in union.iter() {
-        if let Some(found) = t.common_sub_type(i_s, other) {
-            if let Some(result) = &mut result {
+    let mut result: Type = Type::NEVER;
+    if let Type::Union(u2) = other {
+        // While common subtype would work without this special case, sub types with unions on both
+        // sides can explode exponentially (e.g. unions with n=1000 literals each would have to do
+        // n^2 subtypes.
+        let literals2: FastHashSet<_> = u2
+            .iter()
+            .filter_map(|t| match t {
+                Type::Literal(l) => Some(l.value(i_s.db)),
+                _ => None,
+            })
+            .collect();
+        let non_literals2: Vec<_> = u2
+            .iter()
+            .filter(|t| !matches!(t, Type::Literal(_)))
+            .collect();
+        for t1 in union {
+            if let Type::Literal(l1) = t1 {
+                if literals2.contains(&l1.value(i_s.db)) {
+                    result.union_in_place(t1.clone())
+                } else {
+                    if let Some(found) =
+                        common_sub_type_for_union(i_s, non_literals2.iter().copied(), t1)
+                    {
+                        result.union_in_place(found)
+                    }
+                }
+            } else if let Some(found) = t1.common_sub_type(i_s, other) {
                 result.union_in_place(found)
-            } else {
-                result = Some(found)
+            }
+        }
+    } else {
+        for t1 in union {
+            if let Some(found) = t1.common_sub_type(i_s, other) {
+                result.union_in_place(found)
             }
         }
     }
-    result
+    (!result.is_never()).then_some(result)
 }

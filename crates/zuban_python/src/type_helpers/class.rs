@@ -17,8 +17,8 @@ use crate::{
     debug,
     diagnostics::IssueKind,
     file::{
-        ClassInitializer, ClassNodeRef, FLOW_ANALYSIS, FuncNodeRef, TypeVarCallbackReturn,
-        use_cached_return_annotation_type,
+        ClassInitializer, ClassNodeRef, FLOW_ANALYSIS, FuncNodeRef, StarImportError,
+        TypeVarCallbackReturn, use_cached_return_annotation_type,
     },
     format_data::FormatData,
     getitem::SliceType,
@@ -38,10 +38,11 @@ use crate::{
     type_::{
         AnyCause, CallableContent, CallableLike, CallableParam, CallableParams, ClassGenerics,
         Dataclass, DbString, Enum, FormatStyle, FunctionOverload, GenericClass, GenericItem,
-        GenericsList, LiteralValue, LookupResult, NamedTuple, NeverCause, ParamSpecArg,
-        ParamSpecUsage, ParamType, ReplaceTypeVarLikes, StarParamType, StringSlice, Tuple,
-        TupleArgs, Type, TypeVarIndex, TypeVarLike, TypeVarLikeUsage, TypeVarLikes, TypedDict,
-        TypedDictGenerics, Variance, add_any_params_to_params,
+        GenericsList, LiteralValue, LookupArgs, LookupResult, NamedTuple, NeverCause, ParamSpecArg,
+        ParamSpecUsage, ParamType, PrettyCallableOptions, ReplaceTypeVarLikes, StarParamType,
+        StarStarParamType, StringSlice, Tuple, TupleArgs, Type, TypeArgs, TypeVarIndex,
+        TypeVarLike, TypeVarLikeUsage, TypeVarLikes, TypedDict, TypedDictGenerics, Variance,
+        add_any_params_to_params,
     },
     type_helpers::FuncLike,
     utils::{debug_indent, is_magic_method},
@@ -249,7 +250,6 @@ impl<'db: 'a, 'a> Class<'a> {
                     false,
                     Some(self),
                     true,
-                    result_context,
                     None,
                     on_type_error,
                     &|_, calculated_type_args| {
@@ -391,7 +391,7 @@ impl<'db: 'a, 'a> Class<'a> {
                         had_binding_error.set(true);
                         false
                     })
-                    .with_as_self_instance(&|| other.clone())
+                    .with_as_self_instance(&|| Type::Self_)
                     .with_avoid_inferring_return_types(),
                 );
                 let protocol_inf = protocol_lookup_details.lookup.into_inferred();
@@ -405,21 +405,19 @@ impl<'db: 'a, 'a> Class<'a> {
                     continue;
                 }
 
+                // Magic methods are probably never relevant on the object, since Python
+                // ignores all self attributes. This is especially the case if Enums classes
+                // are passed. However it feels a bit weird here and might need to be changed
+                // in the future.
+                let kind = if is_magic_method(name) {
+                    LookupKind::OnlyType
+                } else {
+                    LookupKind::Normal
+                };
                 other.run_after_lookup_on_each_union_member(
-                    i_s,
                     None,
-                    self.node_ref.file,
-                    name,
-                    // Magic methods are probably never relevant on the object, since Python
-                    // ignores all self attributes. This is especially the case if Enums classes
-                    // are passed. However it feels a bit weird here and might need to be changed
-                    // in the future.
-                    if is_magic_method(name) {
-                        LookupKind::OnlyType
-                    } else {
-                        LookupKind::Normal
-                    },
-                    &mut ResultContext::Unknown,
+                    LookupArgs::new(i_s, self.node_ref.file, name).with_kind(kind)
+                    .with_add_issue(
                     &|issue| {
                         // Deprecated should not affect matching
                         if let IssueKind::Deprecated { .. } = &issue {
@@ -429,7 +427,8 @@ impl<'db: 'a, 'a> Class<'a> {
                         debug!("Issue in protocol: {}", issue_str);
                         *had_error.borrow_mut() = Some(issue_str);
                         false
-                    },
+                    }),
+                    &mut ResultContext::Unknown,
                     &mut |_, mut lookup_details| {
                         if name == "__hash__"
                             && other.is_protocol(i_s.db)
@@ -443,6 +442,7 @@ impl<'db: 'a, 'a> Class<'a> {
                         } else if had_error.borrow().is_none() {
                             had_at_least_one_member_with_same_name = true;
                             let protocol_t = protocol_inf.as_cow_type(i_s);
+                            let protocol_t = protocol_t.replace_self(i_s.db, &|| Some(other.clone()));
                             let lookup = lookup_details.lookup.into_inferred();
                             let t2 = lookup.as_cow_type(i_s);
                             let other_setter_type = lookup_details.attr_kind.property_setter_type();
@@ -745,21 +745,28 @@ impl<'db: 'a, 'a> Class<'a> {
     pub fn lookup_symbol(&self, i_s: &InferenceState<'db, '_>, name: &str) -> LookupResult {
         match self.class_storage.class_symbol_table.lookup_symbol(name) {
             None => {
+                let mut import_not_found = false;
                 for star_import in self.node_ref.file.star_imports.iter() {
                     if star_import.scope == self.node_ref.node_index {
                         let self_class = Class::with_self_generics(i_s.db, self.node_ref);
                         let i_s = &i_s.with_class_context(&self_class);
-                        if let Some(result) = self
+                        match self
                             .node_ref
                             .file
                             .name_resolution_for_inference(i_s)
                             .lookup_name_in_star_import(star_import, name, true, None)
                         {
-                            return result.into_lookup_result(i_s);
-                        }
+                            Ok(result) => return result.into_lookup_result(i_s),
+                            Err(StarImportError::NotFound) => {}
+                            Err(StarImportError::ImportNotResolvable) => import_not_found = true,
+                        };
                     }
                 }
-                LookupResult::None
+                if import_not_found {
+                    LookupResult::any(AnyCause::FromError)
+                } else {
+                    LookupResult::None
+                }
             }
             Some(node_index) => {
                 let self_class = Class::with_self_generics(i_s.db, self.node_ref);
@@ -1596,7 +1603,7 @@ impl<'db: 'a, 'a> Class<'a> {
         let class_infos = self.use_cached_class_infos(i_s.db);
         if !class_infos.abstract_attributes.is_empty()
             && !class_infos.incomplete_mro
-            && matches!(self.generics, Generics::NotDefinedYet { .. })
+            && !from_type_type
         {
             args.add_issue(
                 i_s,
@@ -1705,24 +1712,22 @@ impl<'db: 'a, 'a> Class<'a> {
             let result = self.file.ensure_module_symbols_flow_analysis(db);
             if result.is_err() {
                 debug!(
-                    "Wanted to calculate class {:?} diagnostics, but could not calculated file {}",
+                    "Wanted to calculate class {:?} diagnostics, but could not calculate file {}",
                     self.name(),
                     self.file.qualified_name(db)
                 );
             }
             result?;
-            let result = FLOW_ANALYSIS.with(|fa| {
-                fa.with_new_empty_and_delay_further(db, || {
-                    self.file
-                        .inference(&InferenceState::from_class(db, self))
-                        .calculate_class_block_diagnostics(*self, class_block)
-                })
+            let result = FLOW_ANALYSIS.with_new_empty_and_delay_further(db, || {
+                self.file
+                    .inference(&InferenceState::from_class(db, self))
+                    .calculate_class_block_diagnostics(*self, class_block)
             });
             if result.is_err() {
                 debug!(
-                    "Wanted to calculate class {:?} diagnostics, but could not calculate file {}",
+                    "Wanted to calculate class {:?} diagnostics, but could not calculate class {}",
                     self.name(),
-                    self.file.qualified_name(db)
+                    self.qualified_name(db)
                 );
             }
             // At this point we just lose reachability information for the class. This is
@@ -1732,6 +1737,7 @@ impl<'db: 'a, 'a> Class<'a> {
         }
         Ok(())
     }
+
     pub fn ensure_calculated_variance(&self, db: &Database) {
         let Some(class_infos) = self.maybe_cached_class_infos(db) else {
             debug!(
@@ -1773,6 +1779,20 @@ impl<'db: 'a, 'a> Class<'a> {
             if let Some(co_contra) = check_t(base_t) {
                 co &= co_contra.co;
                 contra &= co_contra.contra;
+                if cfg!(feature = "zuban_debug") {
+                    if !co_contra.co {
+                        debug!(
+                            "Base class variances are not covariant (TypeVar #{})",
+                            type_var_index.as_usize()
+                        );
+                    }
+                    if !co_contra.contra {
+                        debug!(
+                            "Base class variances are not contravariant (TypeVar #{})",
+                            type_var_index.as_usize()
+                        );
+                    }
+                }
                 if !co && !contra {
                     return Variance::Invariant;
                 }
@@ -1794,8 +1814,25 @@ impl<'db: 'a, 'a> Class<'a> {
                         );
                         false
                     })
+                    .with_avoid_inferring_return_types()
                     // object has no generics and is therefore not relevant.
-                    .without_object(),
+                    .without_object()
+                    .with_as_self_instance(&|| {
+                        // The type var that we're trying to infer can be remapped in with Self
+                        // like this:
+                        //
+                        //     class X[T]:
+                        //         def x[S](self: X[S]): ...
+                        //
+                        // This is essentially a cycle that we're removing.
+                        self.as_type(i_s.db)
+                            .replace_type_var_likes(i_s.db, &mut |usage| {
+                                (usage.in_definition() == self.node_ref.as_link()
+                                    && usage.index() == type_var_index)
+                                    .then(|| usage.as_any_generic_item())
+                            })
+                            .into_owned()
+                    }),
                 )
             } else {
                 if is_self_attr {
@@ -1900,8 +1937,21 @@ impl<'db: 'a, 'a> Class<'a> {
                     if let Some(co_contra) = check_t(&t) {
                         co &= co_contra.co;
                         contra &= co_contra.contra;
+                        if cfg!(feature = "zuban_debug") {
+                            if !co_contra.co {
+                                debug!(
+                                    "Variance is not covariant (TypeVar #{})",
+                                    type_var_index.as_usize()
+                                );
+                            }
+                            if !co_contra.contra {
+                                debug!(
+                                    "Variance is not contravariant (TypeVar #{})",
+                                    type_var_index.as_usize()
+                                );
+                            }
+                        }
                         if !co_contra.contra {
-                            contra = false;
                             // Attributes starting with _ are considered private and the variance
                             // of them are inferred as such.
                             let is_underscored = || name.starts_with('_') && !is_magic_method(name);
@@ -1957,7 +2007,7 @@ impl<'db: 'a, 'a> Class<'a> {
                     t
                 } else {
                     Cow::Owned(Type::FunctionOverload(FunctionOverload::new(
-                        overloads.into_boxed_slice(),
+                        overloads.into(),
                     )))
                 }
             }
@@ -2230,12 +2280,30 @@ pub(crate) fn check_type_var_variance_validity_for_type(
     type_var_index: TypeVarIndex,
     base_t: &Type,
 ) -> Option<CoContra> {
-    let with_object_t = base_t.replace_type_var_likes(i_s.db, &mut |usage| {
-        if usage.index() == type_var_index
-            && usage.in_definition() == in_definition
-            && let TypeVarLikeUsage::TypeVar(_) = usage
-        {
-            Some(GenericItem::TypeArg(i_s.db.python_state.object_type()))
+    let with_object_t = base_t.maybe_replace_type_var_likes(i_s.db, &mut |usage| {
+        if usage.index() == type_var_index && usage.in_definition() == in_definition {
+            Some(match usage {
+                TypeVarLikeUsage::TypeVar(_) => {
+                    GenericItem::TypeArg(i_s.db.python_state.object_type())
+                }
+                TypeVarLikeUsage::TypeVarTuple(_) => {
+                    let Type::Tuple(tup) = &i_s.db.python_state.tuple_of_obj else {
+                        unreachable!();
+                    };
+                    GenericItem::TypeArgs(TypeArgs::new(tup.args.clone()))
+                }
+                TypeVarLikeUsage::ParamSpec(_) => {
+                    let params = CallableParams::new_simple(Arc::new([
+                        CallableParam::new_anonymous(ParamType::Star(StarParamType::ArbitraryLen(
+                            i_s.db.python_state.object_type(),
+                        ))),
+                        CallableParam::new_anonymous(ParamType::StarStar(
+                            StarStarParamType::ValueType(i_s.db.python_state.object_type()),
+                        )),
+                    ]));
+                    GenericItem::ParamSpecArg(ParamSpecArg::new(params, None))
+                }
+            })
         } else {
             None
         }
@@ -2384,6 +2452,20 @@ impl<'a> TypeOrClass<'a> {
             TypeOrClass::Type(_) => false,
         }
     }
+
+    pub fn defined_at(&self) -> Option<PointLink> {
+        Some(match self {
+            TypeOrClass::Class(c) => c.node_ref.as_link(),
+            TypeOrClass::Type(t) => match t.as_ref() {
+                Type::Dataclass(dc) => dc.class.link,
+                Type::TypedDict(td) => td.defined_at,
+                Type::Enum(enum_) => enum_.defined_at,
+                Type::EnumMember(enum_member) => enum_member.enum_.defined_at,
+                // Type::Literal(literal) => TODO ?
+                _ => return None,
+            },
+        })
+    }
 }
 
 impl<'db: 'a, 'a> Iterator for MroIterator<'db, 'a> {
@@ -2470,14 +2552,11 @@ fn apply_generics_to_base_class<'a>(
         _ if matches!(generics, Generics::None | Generics::NotDefinedYet { .. }) => {
             TypeOrClass::Type(Cow::Borrowed(t))
         }
-        _ => {
-            let new_t = t.replace_type_var_likes_and_self(
-                db,
-                &mut |usage| Some(generics.nth_usage(db, &usage).into_generic_item()),
-                &|| None,
-            );
-            TypeOrClass::Type(new_t.map(Cow::Owned).unwrap_or_else(|| Cow::Borrowed(t)))
-        }
+        _ => TypeOrClass::Type(t.replace_type_var_likes_and_self(
+            db,
+            &mut |usage| Some(generics.nth_usage(db, &usage).into_generic_item()),
+            &|| None,
+        )),
     }
 }
 
@@ -2540,8 +2619,11 @@ fn format_callable_like(
             "{prefix}{}",
             c.format_pretty_detailed(
                 &FormatData::new_short(db),
-                !c.kind.had_first_self_or_class_annotation() && !other_had_first_annotation,
-                false,
+                PrettyCallableOptions {
+                    show_self_annotation: other_had_first_annotation,
+                    avoid_classmethod_param: true,
+                    ..Default::default()
+                }
             )
         )
     };
@@ -2663,17 +2745,12 @@ fn init_as_callable(
     };
     Some(match callable {
         CallableLike::Callable(c) => CallableLike::Callable(to_callable(&c)?),
-        CallableLike::Overload(callables) => {
-            let funcs: Box<_> = callables
+        CallableLike::Overload(callables) => CallableLike::from_overload_funcs(
+            callables
                 .iter_functions()
                 .filter_map(|c| to_callable(c))
-                .collect();
-            match funcs.len() {
-                0 => return None,
-                1 => CallableLike::Callable(funcs.into_vec().into_iter().next().unwrap()),
-                _ => CallableLike::Overload(FunctionOverload::new(funcs)),
-            }
-        }
+                .collect(),
+        )?,
     })
 }
 
@@ -2681,6 +2758,7 @@ fn django_model_params(i_s: &InferenceState, cls: Class) -> Vec<CallableParam> {
     let mut params = vec![];
     for (_, cls) in cls.mro(i_s.db) {
         if let Some(cls) = cls.maybe_class() {
+            let mut should_use_symbols = vec![];
             for (_, symbol) in cls.class_storage.class_symbol_table.iter() {
                 let name_ref = NodeRef::new(cls.file, *symbol);
                 let name = name_ref.expect_name();
@@ -2694,19 +2772,23 @@ fn django_model_params(i_s: &InferenceState, cls: Class) -> Vec<CallableParam> {
                     && let Some(field_cls) = inf.as_cow_type(i_s).maybe_class(i_s.db)
                     && field_cls.is_django_field(i_s.db)
                 {
-                    params.push(CallableParam {
-                        name: Some(DbString::StringSlice(StringSlice::from_name(
-                            cls.file.file_index,
-                            name,
-                        ))),
-                        // TODO this should not be any but probably the generic of
-                        // _pyi_private_get_type
-                        type_: ParamType::PositionalOrKeyword(Type::Any(AnyCause::Internal)),
-                        // Params are optional in Django.
-                        has_default: true,
-                        might_have_type_vars: false,
-                    });
+                    should_use_symbols.push((symbol, name));
                 }
+            }
+            should_use_symbols.sort_by_key(|(symbol_index, _)| **symbol_index);
+            for (_, name) in should_use_symbols {
+                params.push(CallableParam {
+                    name: Some(DbString::StringSlice(StringSlice::from_name(
+                        cls.file.file_index,
+                        name,
+                    ))),
+                    // TODO this should not be any but probably the generic of
+                    // _pyi_private_get_type
+                    type_: ParamType::PositionalOrKeyword(Type::Any(AnyCause::Internal)),
+                    // Params are optional in Django.
+                    has_default: true,
+                    might_have_type_vars: false,
+                });
             }
         }
     }
@@ -2716,6 +2798,7 @@ fn django_model_params(i_s: &InferenceState, cls: Class) -> Vec<CallableParam> {
     params
 }
 
+#[derive(Debug)]
 pub(crate) enum ClassConstructor<'a> {
     // A data structure to show wheter __init__ or __new__ is the relevant constructor for a class
     DunderNew {

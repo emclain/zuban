@@ -14,7 +14,7 @@ use crate::{
     node_ref::NodeRef,
     type_::{
         AnyCause, CallableContent, CallableParam, CallableParams, ClassGenerics, CustomBehavior,
-        ParamType, Tuple, Type, TypeArgs, TypeVarLikes, dataclasses_replace,
+        ParamType, Tuple, TupleArgs, Type, TypeArgs, TypeVarLikes, dataclasses_replace,
     },
     type_helpers::{Class, FirstParamProperties, Function, Instance, cache_class_name},
 };
@@ -173,18 +173,20 @@ pub(crate) struct PythonState {
     builtins_hasattr_index: NodeIndex,
     builtins_len_index: NodeIndex,
     builtins_notimplementederror: NodeIndex,
-    builtins_notimplemented_type: NodeIndex,
     pub builtins_int_mro: Box<[BaseClass]>,
     pub builtins_bool_mro: Box<[BaseClass]>,
     pub builtins_str_mro: Box<[BaseClass]>,
     pub builtins_bytes_mro: Box<[BaseClass]>,
+    pub notimplemented_type_link: PointLink,
     typeshed_supports_keys_and_get_item_index: NodeIndex,
     typing_type_var_index: NodeIndex,
     type_var_tuple_link: PointLink,
     param_spec_link: PointLink,
+    sentinel_link: PointLink,
     pub typinglike_namedtuple_link: PointLink,
     new_type_link: PointLink,
     reveal_type_link: PointLink,
+    pub disjoint_base_link: PointLink,
     typing_cast_index: NodeIndex,
     typing_coroutine_index: NodeIndex,
     typing_iterator_index: NodeIndex,
@@ -211,6 +213,9 @@ pub(crate) struct PythonState {
     pub typing_typed_dict_bases: Box<[BaseClass]>,
     types_module_type_index: NodeIndex,
     types_none_type_index: Option<NodeIndex>,
+    types_generator_type_index: NodeIndex,
+    types_async_generator_type_index: NodeIndex,
+    types_coroutine_type_index: NodeIndex,
     types_ellipsis_type_index: Option<NodeIndex>,
     types_union_type_index: Option<NodeIndex>,
     types_generic_alias_index: NodeIndex,
@@ -236,7 +241,7 @@ pub(crate) struct PythonState {
     mypy_extensions_var_arg_func: NodeIndex,
     dataclasses_capital_field_index: NodeIndex,
     dataclasses_replace_index: NodeIndex,
-    warnings_deprecated_index: Option<NodeIndex>,
+    pub deprecated_link: PointLink,
     pub type_of_any: Type,
     pub type_of_self: Type,
     pub type_of_arbitrary_tuple: Type,
@@ -302,7 +307,6 @@ impl PythonState {
             builtins_staticmethod_index: 0,
             builtins_property_index: 0,
             builtins_notimplementederror: 0,
-            builtins_notimplemented_type: 0,
             builtins_isinstance_index: 0,
             builtins_issubclass_index: 0,
             builtins_super_index: 0,
@@ -313,8 +317,12 @@ impl PythonState {
             builtins_bool_mro: Box::new([]),  // will be set later
             builtins_str_mro: Box::new([]),   // will be set later
             builtins_bytes_mro: Box::new([]), // will be set later
+            notimplemented_type_link: PointLink::new(FileIndex(0), 0),
             types_module_type_index: 0,
             types_none_type_index: None,
+            types_generator_type_index: 0,
+            types_async_generator_type_index: 0,
+            types_coroutine_type_index: 0,
             types_ellipsis_type_index: None,
             types_union_type_index: None,
             builtins_ellipsis_fallback_index: None,
@@ -322,9 +330,11 @@ impl PythonState {
             typing_type_var_index: 0,
             type_var_tuple_link: PointLink::new(FileIndex(0), 0),
             param_spec_link: PointLink::new(FileIndex(0), 0),
+            sentinel_link: PointLink::new(FileIndex(0), 0),
             typinglike_namedtuple_link: PointLink::new(FileIndex(0), 0),
             new_type_link: PointLink::new(FileIndex(0), 0),
             reveal_type_link: PointLink::new(FileIndex(0), 0),
+            disjoint_base_link: PointLink::new(FileIndex(0), 0),
             type_alias_type_link: PointLink::new(FileIndex(0), 0),
             typing_cast_index: 0,
             typing_overload_index: 0,
@@ -371,7 +381,7 @@ impl PythonState {
             mypy_extensions_var_arg_func: 0,
             dataclasses_capital_field_index: 0,
             dataclasses_replace_index: 0,
-            warnings_deprecated_index: None,
+            deprecated_link: PointLink::new(FileIndex(0), 0),
             type_of_any: Type::Type(Arc::new(Type::Any(AnyCause::Todo))),
             type_of_self: Type::Type(Arc::new(Type::Self_)),
             type_of_arbitrary_tuple: Type::Type(Arc::new(Type::Tuple(
@@ -560,8 +570,21 @@ impl PythonState {
                 );
             };
         }
-        macro_rules! cache_typing_link_with_typing_extensions_fallback {
-            ($attr_name:ident, $name:literal, $is_func:expr) => {
+        macro_rules! cache_link_with_typing_extensions_fallback {
+            ($attr_name:ident, $name:literal, $original_module:ident, $is_func:expr) => {
+                cache_link_with_fallback!(
+                    $attr_name,
+                    $name,
+                    $original_module,
+                    $is_func,
+                    typing_extensions,
+                    $name
+                )
+            };
+        }
+        macro_rules! cache_link_with_fallback {
+            ($attr_name:ident, $name:literal, $original_module:ident, $is_func:expr,
+             $fallback_module:ident, $fallback_name:literal) => {
                 // NewType is special, because the fallback is a function in current
                 // Typeshed, so use TypingExtensions for now...
                 let use_new_type_from_typing_extensions = $name == "NewType" && legacy_new_type(db);
@@ -571,23 +594,24 @@ impl PythonState {
                         if use_new_type_from_typing_extensions {
                             return db.python_state.typing_extensions();
                         }
-                        db.python_state.typing()
+                        db.python_state.$original_module()
                     },
                     $name,
                     |db, new_index| {
                         let Some(new_index) = new_index else {
                             cache_index(
                                 db,
-                                |db| db.python_state.typing_extensions(),
-                                $name,
+                                |db| db.python_state.$fallback_module(),
+                                $fallback_name,
                                 |db, new_index| {
                                     db.python_state.$attr_name = PointLink::new(
-                                        db.python_state.typing_extensions().file_index,
+                                        db.python_state.$fallback_module().file_index,
                                         new_index.unwrap_or_else(|| {
                                             panic!(
                                                 "Expected a valid identifier {:?} \
-                                                 in typeshed module typing_extensions",
+                                                 in typeshed module {}",
                                                 $name,
+                                                stringify!($fallback),
                                             )
                                         }),
                                     );
@@ -599,7 +623,7 @@ impl PythonState {
                         let file_index = if use_new_type_from_typing_extensions {
                             db.python_state.typing_extensions().file_index
                         } else {
-                            db.python_state.typing().file_index
+                            db.python_state.$original_module().file_index
                         };
                         db.python_state.$attr_name = PointLink::new(file_index, new_index);
                     },
@@ -647,6 +671,12 @@ impl PythonState {
             "total_ordering",
             true
         );
+        cache_link_with_typing_extensions_fallback!(
+            disjoint_base_link,
+            "disjoint_base",
+            typing,
+            true
+        );
         cache_index!(builtins_object_index, builtins, "object");
         cache_index!(builtins_type_index, builtins, "type");
         cache_index!(abc_abc_meta_index, abc, "ABCMeta");
@@ -692,34 +722,41 @@ impl PythonState {
             "NotImplementedError"
         );
         cache_index!(
-            builtins_notimplemented_type,
-            builtins,
-            "_NotImplementedType"
-        );
-        cache_index!(
             typeshed_supports_keys_and_get_item_index,
             typeshed,
             "SupportsKeysAndGetItem"
         );
-        cache_typing_link_with_typing_extensions_fallback!(
+        cache_link_with_typing_extensions_fallback!(
             type_var_tuple_link,
             "TypeVarTuple",
+            typing,
             false
         );
-        cache_typing_link_with_typing_extensions_fallback!(param_spec_link, "ParamSpec", false);
-        cache_typing_link_with_typing_extensions_fallback!(
+        cache_link_with_typing_extensions_fallback!(param_spec_link, "ParamSpec", typing, false);
+        cache_link_with_typing_extensions_fallback!(sentinel_link, "Sentinel", builtins, false);
+        cache_link_with_typing_extensions_fallback!(
             typinglike_namedtuple_link,
             "NamedTuple",
+            typing,
             false
         );
-        cache_typing_link_with_typing_extensions_fallback!(new_type_link, "NewType", false);
-        cache_typing_link_with_typing_extensions_fallback!(reveal_type_link, "reveal_type", true);
-        cache_typing_link_with_typing_extensions_fallback!(
+        cache_link_with_typing_extensions_fallback!(new_type_link, "NewType", typing, false);
+        cache_link_with_typing_extensions_fallback!(reveal_type_link, "reveal_type", typing, true);
+        cache_link_with_typing_extensions_fallback!(
             type_alias_type_link,
             "TypeAliasType",
+            typing,
             false
         );
-        cache_typing_link_with_typing_extensions_fallback!(typing_override_link, "override", true);
+        cache_link_with_typing_extensions_fallback!(typing_override_link, "override", typing, true);
+        cache_link_with_fallback!(
+            notimplemented_type_link,
+            "NotImplementedType",
+            types,
+            false,
+            builtins,
+            "_NotImplementedType"
+        );
         cache_index!(typing_cast_index, typing, "cast", true);
         cache_index!(typing_coroutine_index, typing, "Coroutine");
         cache_index!(typing_iterator_index, typing, "Iterator");
@@ -739,6 +776,13 @@ impl PythonState {
         cache_optional_index!(types_none_type_index, types, "NoneType");
         cache_optional_index!(types_ellipsis_type_index, types, "EllipsisType");
         cache_optional_index!(types_union_type_index, types, "UnionType");
+        cache_index!(types_generator_type_index, types, "GeneratorType");
+        cache_index!(
+            types_async_generator_type_index,
+            types,
+            "AsyncGeneratorType"
+        );
+        cache_index!(types_coroutine_type_index, types, "CoroutineType");
         cache_index!(types_generic_alias_index, types, "GenericAlias");
         if let Some(ellipsis) = db.python_state.builtins().lookup_symbol("ellipsis")
             && matches!(
@@ -768,10 +812,7 @@ impl PythonState {
 
         cache_index!(dataclasses_replace_index, dataclasses_file, "replace", true);
 
-        cache_optional_index!(warnings_deprecated_index, warnings, "deprecated");
-        if db.python_state.warnings_deprecated_index.is_none() {
-            cache_optional_index!(warnings_deprecated_index, typing_extensions, "deprecated");
-        }
+        cache_link_with_typing_extensions_fallback!(deprecated_link, "deprecated", warnings, false);
 
         cache_index!(abc_abstractmethod_index, abc, "abstractmethod", true);
         cache_index!(abc_abstractmethod_index, abc, "abstractmethod", true);
@@ -1042,7 +1083,6 @@ impl PythonState {
     attribute_node_ref!(builtins, pub hasattr_node_ref, builtins_hasattr_index);
     attribute_node_ref!(builtins, pub len_node_ref, builtins_len_index);
     class_node_ref!(builtins, pub function_node_ref, builtins_function_index);
-    attribute_node_ref!(builtins, pub notimplemented_type_node_ref, builtins_notimplemented_type);
     attribute_node_ref!(
         builtins,
         pub base_exception_node_ref,
@@ -1068,7 +1108,6 @@ impl PythonState {
     class_node_ref!(typing, pub mapping_node_ref, typing_mapping_index);
     class_node_ref!(typing, pub mutable_mapping_node_ref, typing_mutable_mapping_index);
     class_node_ref!(typing, pub keys_view_node_ref, typing_keys_view_index);
-    optional_attribute_node_ref!(warnings, pub deprecated, warnings_deprecated_index);
     attribute_node_ref!(typing, pub typing_final, typing_final_index);
     class_node_ref!(typing, pub generator_node_ref, typing_generator_index);
     attribute_node_ref!(typing, pub iterable_node_ref, typing_iterable_index);
@@ -1097,6 +1136,7 @@ impl PythonState {
     class_node_ref!(_collections_abc, pub _collections_abc_dict_keys_node_ref, _collections_abc_dict_keys_index);
     attribute_node_ref!(functools, pub total_ordering_node_ref, functools_total_ordering_index);
     attribute_node_ref!(typing, pub runtime_checkable_node_ref, typing_runtime_checkable_index);
+
     attribute_node_ref!(typing_extensions, pub typing_extensions_runtime_checkable_node_ref, typing_extensions_runtime_checkable_index);
 
     attribute_link!(builtins, pub object_link, builtins_object_index);
@@ -1133,6 +1173,10 @@ impl PythonState {
     attribute_link!(typing, pub async_iterable_link, typing_async_iterable_index);
     attribute_link!(typing, pub no_type_check_link, typing_no_type_check_index);
     attribute_link!(collections, pub defaultdict_link, collections_defaultdict_index);
+    attribute_link!(types, pub generator_type_link, types_generator_type_index);
+    attribute_link!(types, pub async_generator_type_link, types_async_generator_type_index);
+    attribute_link!(types, pub coroutine_type_link, types_coroutine_type_index);
+
     optional_attribute_link!(types, ellipsis_type_link, types_ellipsis_type_index);
     optional_attribute_link!(types, pub union_type_link, types_union_type_index);
     optional_attribute_link!(
@@ -1145,7 +1189,6 @@ impl PythonState {
         dataclasses_capital_field_link,
         dataclasses_capital_field_index
     );
-    optional_attribute_link!(warnings, pub deprecated_link, warnings_deprecated_index);
 
     node_ref_to_class!(pub object_class, object_node_ref);
     node_ref_to_class!(int, int_node_ref);
@@ -1179,6 +1222,7 @@ impl PythonState {
 
     link_to_type_class_without_generic!(pub type_var_tuple_type, type_var_tuple_link);
     link_to_type_class_without_generic!(pub param_spec_type, param_spec_link);
+    link_to_type_class_without_generic!(pub sentinel_type, sentinel_link);
     link_to_type_class_without_generic!(pub new_type_type, new_type_link);
     link_to_type_class_without_generic!(pub typing_named_tuple_type, typinglike_namedtuple_link);
     link_to_type_class_without_generic!(pub type_alias_type_type, type_alias_type_link);
@@ -1255,6 +1299,17 @@ impl PythonState {
         )
     }
 
+    pub fn object_type_ref(&self) -> &Type {
+        // This is a bit weird because it retrieves the object type from a strange place
+        let Type::Tuple(tup) = &self.tuple_of_obj else {
+            unreachable!();
+        };
+        let TupleArgs::ArbitraryLen(obj) = &tup.args else {
+            unreachable!();
+        };
+        &**obj
+    }
+
     pub fn isinstance_type(&self, db: &Database) -> Type {
         node_ref_to_global_func_type(db, self.isinstance_node_ref())
     }
@@ -1265,6 +1320,18 @@ impl PythonState {
 
     pub fn reveal_type(&self, db: &Database) -> Type {
         node_ref_to_global_func_type(db, NodeRef::from_link(db, self.reveal_type_link))
+    }
+
+    pub fn is_generator(&self, link: PointLink) -> bool {
+        link == self.generator_link() || link == self.generator_type_link()
+    }
+
+    pub fn is_async_generator(&self, link: PointLink) -> bool {
+        link == self.async_generator_link() || link == self.async_generator_type_link()
+    }
+
+    pub fn is_coroutine(&self, link: PointLink) -> bool {
+        link == self.coroutine_link() || link == self.coroutine_type_link()
     }
 }
 
@@ -1358,6 +1425,8 @@ fn typing_changes(
     setup_type_alias(typing, "DefaultDict", collections, "defaultdict");
     setup_type_alias(typing, "Deque", collections, "deque");
     setup_type_alias(typing, "OrderedDict", collections, "OrderedDict");
+    // Somehow this is defined in typing_extensions as well
+    setup_type_alias(typing_extensions, "OrderedDict", collections, "OrderedDict");
 
     let t = typing_extensions;
     // TODO this is completely wrong, but for now it's good enough
@@ -1383,8 +1452,10 @@ fn typing_changes(
     set_typing_inference(t, "assert_type", Specific::AssertTypeFunction);
     set_typing_inference(t, "NotRequired", Specific::TypingNotRequired);
     set_typing_inference(t, "Required", Specific::TypingRequired);
+    set_typing_inference(t, "ReadOnly", Specific::TypingReadOnly);
     set_typing_inference(t, "dataclass_transform", Specific::TypingDataclassTransform);
     set_typing_inference(t, "TypeForm", Specific::TypingTypeForm);
+    set_typing_inference(t, "Sentinel", Specific::BuiltinsSentinel);
 
     for module in [typing, mypy_extensions, typing_extensions] {
         set_typing_inference(module, "TypedDict", Specific::TypingTypedDict);

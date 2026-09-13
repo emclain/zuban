@@ -29,7 +29,7 @@ macro_rules! replace_class_vars {
                     },
                     &|| None,
                 )
-                .unwrap_or($g.clone()),
+                .into_owned(),
             ),
         }
     };

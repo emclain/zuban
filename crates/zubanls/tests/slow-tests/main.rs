@@ -19,7 +19,7 @@ use lsp_types::{
     ReferenceParams, RenameParams, SelectionRangeParams, SemanticToken, SemanticTokenType,
     SemanticTokens, SemanticTokensParams, SemanticTokensRangeParams,
     SemanticTokensServerCapabilities, SignatureHelpParams, SymbolKind,
-    TextDocumentContentChangeEvent, TextDocumentIdentifier, TextDocumentPositionParams, Uri,
+    TextDocumentContentChangeEvent, TextDocumentIdentifier, TextDocumentPositionParams, Url,
     WorkDoneProgressParams, WorkspaceDiagnosticParams, WorkspaceSymbolParams,
     request::{
         CodeActionRequest, Completion, DocumentDiagnosticRequest, DocumentHighlightRequest,
@@ -32,7 +32,9 @@ use lsp_types::{
 };
 
 mod connection;
+mod custom;
 mod support;
+mod test_initialization_options;
 
 use connection::Connection;
 use serde::Deserialize as _;
@@ -49,7 +51,7 @@ use support::Project;
 #[parallel]
 fn basic_server_setup() {
     let con = Connection::new();
-    let response = con.initialize(&["/foo/bar"], None, true);
+    let response = con.initialize(&["/foo/bar"], None, true, false, None);
 
     // Check diagnostic capabilities
     {
@@ -76,7 +78,7 @@ fn basic_server_setup() {
 #[test]
 #[parallel]
 fn request_after_shutdown_is_invalid() {
-    let con = Connection::initialized(&["/foo/bar"], None, true);
+    let con = Connection::initialized(&["/foo/bar"], None, true, false, None);
     con.request::<lsp_types::request::Shutdown>(());
 
     let expect_shutdown_already_requested = |response: Response| {
@@ -92,7 +94,9 @@ fn request_after_shutdown_is_invalid() {
 
     let r = con.request_with_response::<lsp_types::request::DocumentDiagnosticRequest>(
         DocumentDiagnosticParams {
-            text_document: TextDocumentIdentifier::new(Uri::from_str("does-not-exist").unwrap()),
+            text_document: TextDocumentIdentifier::new(
+                Url::from_str("file://does-not-exist").unwrap(),
+            ),
             identifier: None,
             previous_result_id: None,
             work_done_progress_params: WorkDoneProgressParams::default(),
@@ -108,7 +112,7 @@ fn request_after_shutdown_is_invalid() {
 #[test]
 #[parallel]
 fn exit_without_shutdown() {
-    let con = Connection::initialized(&["/foo/bar"], None, true);
+    let con = Connection::initialized(&["/foo/bar"], None, true, false, None);
     con.notify::<lsp_types::notification::Exit>(());
 }
 
@@ -297,6 +301,111 @@ fn diagnostics_for_saved_files_and_workspace_diagnostics() {
 }
 
 #[test]
+#[serial]
+fn diagnostics_for_protocols_invalidation() {
+    let server = Project::with_fixture(
+        r#"
+        [file pyproject.toml]
+
+        [file foo.py]
+        from typing import Protocol
+        from other import Alias
+
+        class P(Protocol):
+            x: int
+        class C:
+            x: Alias
+
+        p: P = C()
+
+        [file other.py]
+        Alias = int
+        "#,
+    )
+    .into_server();
+
+    server.request_and_expect_json::<DocumentDiagnosticRequest>(
+        DocumentDiagnosticParams {
+            text_document: server.doc_id("foo.py"),
+            identifier: None,
+            previous_result_id: None,
+            partial_result_params: PartialResultParams::default(),
+            work_done_progress_params: WorkDoneProgressParams::default(),
+        },
+        json!({
+            "items": [],
+            "kind": "full"
+        }),
+    );
+
+    // Change if the protocol matches
+    server.write_file_and_wait("other.py", "Alias = str\n");
+
+    server.request_and_expect_json::<DocumentDiagnosticRequest>(
+        DocumentDiagnosticParams {
+            text_document: server.doc_id("foo.py"),
+            identifier: None,
+            previous_result_id: None,
+            partial_result_params: PartialResultParams::default(),
+            work_done_progress_params: WorkDoneProgressParams::default(),
+        },
+        json!({
+            "items": [
+              {
+                "code": "assignment",
+                "message": "Incompatible types in assignment (expression has type \"C\", variable has type \"P\")",
+                "range": {
+                  "end": {
+                    "character": 10,
+                    "line": 8
+                  },
+                  "start": {
+                    "character": 7,
+                    "line": 8
+                  }
+                },
+                "severity": 1,
+                "source": "zuban"
+              },
+              {
+                "code": "note",
+                "message": "Following member(s) of \"C\" have conflicts:",
+                "range": {
+                  "end": {
+                    "character": 10,
+                    "line": 8
+                  },
+                  "start": {
+                    "character": 7,
+                    "line": 8
+                  }
+                },
+                "severity": 3,
+                "source": "zuban"
+              },
+              {
+                "code": "note",
+                "message": "    x: expected \"int\", got \"str\"",
+                "range": {
+                  "end": {
+                    "character": 10,
+                    "line": 8
+                  },
+                  "start": {
+                    "character": 7,
+                    "line": 8
+                  }
+                },
+                "severity": 3,
+                "source": "zuban"
+              }
+            ],
+            "kind": "full"
+        }),
+    );
+}
+
+#[test]
 #[parallel]
 fn in_memory_file_changes() {
     let server = Project::with_fixture(
@@ -367,6 +476,43 @@ fn in_memory_file_changes() {
     assert!(response.result.is_none());
     assert!(error.message.contains("does not exist"));
     assert_eq!(error.code, lsp_server::ErrorCode::InvalidParams as i32);
+}
+
+#[test]
+#[parallel]
+fn test_relative_namespace_import() {
+    // From GH #486
+    let server = Project::with_fixture(
+        r#"
+        [file main.py]
+        from namespace import x
+        x.func
+        [file namespace/x.py]
+        from .y import func
+        [file namespace/y.py]
+        def func(): ...
+
+        [file pyproject.toml]
+        [tool.zuban]
+        mypy_path = [".", "namespace"]
+        "#,
+    )
+    .into_server();
+    assert!(server.diagnostics_for_file("namespace/x.py").is_empty());
+    assert!(server.diagnostics_for_file("main.py").is_empty());
+
+    let pos =
+        TextDocumentPositionParams::new(server.doc_id("namespace/x.py"), Position::new(0, 19));
+    let actual = server.request_with_expected_response::<Completion>(CompletionParams {
+        text_document_position: pos,
+        work_done_progress_params: Default::default(),
+        partial_result_params: Default::default(),
+        context: None,
+    });
+    let obj = actual.as_array().expect("array")[0]
+        .as_object()
+        .expect("object");
+    assert_eq!(obj["label"].as_str().expect("label"), "func");
 }
 
 #[test]
@@ -564,7 +710,7 @@ fn files_outside_of_root() {
     let response =
         server.request_with_response::<DocumentDiagnosticRequest>(DocumentDiagnosticParams {
             text_document: TextDocumentIdentifier {
-                uri: Uri::from_str(&format!(
+                uri: Url::from_str(&format!(
                     "file://{}/outside_workdir.py",
                     server.tmp_dir.path_for_uri()
                 ))
@@ -585,17 +731,20 @@ fn files_outside_of_root() {
     );
 
     assert_eq!(d("base/with%20space.py"), [r#""bytes" not callable"#]);
+    // This is not a valid URI, but a lot of clients seem to do that, so we allow that for now and
+    // test it here so LSP clients can do that.
+    assert_eq!(d("base/with space.py"), [r#""bytes" not callable"#]);
 
     // Check random files that don't really make sense
     let check_other_uris = [
-        Uri::from_str("file:///bar/foo").unwrap(),
-        Uri::from_str("file://foo").unwrap(),
-        Uri::from_str("file://").unwrap(),
-        Uri::from_str("https://www.example.com/foo.py").unwrap(),
-        Uri::from_str("file:/single_slash").unwrap(),
+        Url::from_str("file:///bar/foo").unwrap(),
+        Url::from_str("file://foo").unwrap(),
+        Url::from_str("file://").unwrap(),
+        Url::from_str("https://www.example.com/foo.py").unwrap(),
+        Url::from_str("file:/single_slash").unwrap(),
     ];
 
-    let diags_for_uri = |uri: &Uri| {
+    let diags_for_uri = |uri: &Url| {
         server
             .full_diagnostics_for_abs_path(TextDocumentIdentifier { uri: uri.clone() })
             .into_iter()
@@ -661,30 +810,25 @@ fn files_outside_of_root_with_push_diagnostics() {
 
     // Check random files that don't really make sense
     let mut check_other_uris = vec![
-        Uri::from_str("file:///bar/foo").unwrap(),
-        Uri::from_str("file://foo").unwrap(),
-        Uri::from_str("file://").unwrap(),
-        Uri::from_str("https://www.example.com/foo.py").unwrap(),
-        Uri::from_str("file:/single_slash").unwrap(),
+        Url::from_str("file:///bar/foo").unwrap(),
+        Url::from_str("https://www.example.com/foo.py").unwrap(),
     ];
 
     if cfg!(windows) {
-        check_other_uris.pop();
-        check_other_uris.push(Uri::from_str("file:/C:/single_slash").unwrap());
+        check_other_uris.push(Url::from_str("file:/C:/single_slash").unwrap());
+    } else {
+        check_other_uris.push(Url::from_str("file:/single_slash").unwrap());
+        // Some of these are just really weird on Windows, because these paths don't really exist.
+        check_other_uris.push(Url::from_str("file://foo").unwrap());
+        check_other_uris.push(Url::from_str("file://").unwrap());
     }
 
     for uri in &mut check_other_uris {
         server.open_in_memory_file_for_uri(uri.clone(), "import m\n1()");
         let (file, diags) = server.expect_publish_diagnostics_with_uri();
-        if uri.authority().is_none() {
+        if uri.authority() == "" {
             // Make sure all uris have an authority, because that's how zubanls returns it.
-            *uri = Uri::from_str(&uri.as_str().replace("file:/", "file:///")).unwrap();
-        }
-        if cfg!(windows) && (uri.as_str() == "file://foo" || uri.as_str() == "file://") {
-            // TODO this is probably a bug in Windows handling, but for now this shouldn't matter
-            // and we leave it like that as long as it does not crash. Also these paths don't
-            // really exist on Windows
-            *uri = Uri::from_str(&uri.as_str().replace("file:/", "file://")).unwrap();
+            *uri = Url::from_str(&uri.as_str().replace("file:/", "file:///")).unwrap();
         }
         assert_eq!(file.as_str(), uri.as_str());
         assert_eq!(diags, [r#""int" not callable"#]);
@@ -692,6 +836,7 @@ fn files_outside_of_root_with_push_diagnostics() {
 
     let in_mem_uri = &format!("file://{}/outside_in_mem.py", server.tmp_dir.path_for_uri());
     let m_uri = &format!("file://{}/base/m.py", server.tmp_dir.path_for_uri());
+
     // The in memory files should still work after a panic
     server.raise_and_recover_panic_in_language_server();
     let mut expected: Vec<_> = check_other_uris
@@ -805,7 +950,7 @@ fn diagnostics_positions() {
 
 #[test]
 #[serial]
-fn check_panic_recovery() {
+fn check_panic_recovery_without_push() {
     let server = Project::with_fixture(
         r#"
         [file foo.py]
@@ -1228,6 +1373,39 @@ fn test_virtual_env_with_pth_into_working_dir() {
     assert_eq!(
         server.diagnostics_for_file("other_project/other_project/__init__.py"),
         [r#""int" not callable"#]
+    );
+}
+
+#[test]
+#[serial]
+fn test_lsp_root_path_wrong() {
+    let server = Project::with_fixture(&format!(
+        r#"
+        [file pyproject.toml]
+
+        [file inner/__init__.py]
+
+        [file inner/something.py]
+
+        [file inner/other.py]
+        from inner import something as x
+        import something
+
+        [file outer.py]
+        from inner import something as x
+        import something
+        "#
+    ))
+    .root("inner")
+    .into_server();
+
+    assert_eq!(
+        server.diagnostics_for_file("outer.py"),
+        ["Cannot find implementation or library stub for module named \"something\""]
+    );
+    assert_eq!(
+        server.diagnostics_for_file("inner/other.py"),
+        ["Cannot find implementation or library stub for module named \"something\""]
     );
 }
 
@@ -2326,7 +2504,7 @@ fn check_notebook_cell_change() {
 
 #[test]
 #[serial]
-fn test_symbols() {
+fn test_symbols_nested() {
     let server = Project::with_fixture(
         r#"
         [file foo.py]
@@ -2782,6 +2960,224 @@ fn test_symbols() {
             }
           }
         ]),
+    );
+}
+
+#[test]
+#[serial]
+fn test_symbols_flat() {
+    let server = Project::with_fixture(
+        r#"
+        [file foo.py]
+        a: int = 1
+        b = ""
+        type Alias = int
+
+        class X:
+            x: int
+
+            def f(self, param: int) -> None:
+                func_var: int = 1
+
+            class Y:
+                def g(self, param: int) -> None: ...
+
+        [file bar.py]
+        x = 1
+        "#,
+    )
+    .without_hierarchical_document_symbol_support()
+    .into_server();
+
+    let foo_py = server.doc_id("foo.py").uri;
+    let bar_py = server.doc_id("bar.py").uri;
+
+    server.request_and_expect_json::<WorkspaceSymbolRequest>(
+        WorkspaceSymbolParams::default(),
+        json!([
+          {
+            "kind": 13,
+            "location": {
+              "range": {
+                "end": {
+                  "character": 1,
+                  "line": 0
+                },
+                "start": {
+                  "character": 0,
+                  "line": 0
+                }
+              },
+              "uri": foo_py,
+            },
+            "name": "a"
+          },
+          {
+            "kind": 11,
+            "location": {
+              "range": {
+                "end": {
+                  "character": 10,
+                  "line": 2
+                },
+                "start": {
+                  "character": 5,
+                  "line": 2
+                }
+              },
+              "uri": foo_py,
+            },
+            "name": "Alias"
+          },
+          {
+            "containerName": "X",
+            "kind": 8,
+            "location": {
+              "range": {
+                "end": {
+                  "character": 5,
+                  "line": 5
+                },
+                "start": {
+                  "character": 4,
+                  "line": 5
+                }
+              },
+              "uri": foo_py,
+            },
+            "name": "x"
+          },
+          {
+            "containerName": "X.Y",
+            "kind": 6,
+            "location": {
+              "range": {
+                "end": {
+                  "character": 13,
+                  "line": 11
+                },
+                "start": {
+                  "character": 12,
+                  "line": 11
+                }
+              },
+              "uri": foo_py,
+            },
+            "name": "g"
+          },
+          {
+            "containerName": "X",
+            "kind": 5,
+            "location": {
+              "range": {
+                "end": {
+                  "character": 11,
+                  "line": 10
+                },
+                "start": {
+                  "character": 10,
+                  "line": 10
+                }
+              },
+              "uri": foo_py,
+            },
+            "name": "Y"
+          },
+          {
+            "containerName": "X",
+            "kind": 6,
+            "location": {
+              "range": {
+                "end": {
+                  "character": 9,
+                  "line": 7
+                },
+                "start": {
+                  "character": 8,
+                  "line": 7
+                }
+              },
+              "uri": foo_py,
+            },
+            "name": "f"
+          },
+          {
+            "kind": 5,
+            "location": {
+              "range": {
+                "end": {
+                  "character": 7,
+                  "line": 4
+                },
+                "start": {
+                  "character": 6,
+                  "line": 4
+                }
+              },
+              "uri": foo_py,
+            },
+            "name": "X"
+          },
+          {
+            "kind": 13,
+            "location": {
+              "range": {
+                "end": {
+                  "character": 1,
+                  "line": 1
+                },
+                "start": {
+                  "character": 0,
+                  "line": 1
+                }
+              },
+              "uri": foo_py,
+            },
+            "name": "b"
+          },
+          {
+            "kind": 13,
+            "location": {
+              "range": {
+                "end": {
+                  "character": 1,
+                  "line": 0
+                },
+                "start": {
+                  "character": 0,
+                  "line": 0
+                }
+              },
+              "uri": bar_py,
+            },
+            "name": "x"
+          }
+        ]),
+    );
+
+    server.request_and_expect_json::<DocumentSymbolRequest>(
+        DocumentSymbolParams {
+            text_document: server.doc_id("bar.py"),
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        },
+        json!([{
+          "kind": 13,
+          "location": {
+            "range": {
+              "end": {
+                "character": 5,
+                "line": 0
+              },
+              "start": {
+                "character": 0,
+                "line": 0
+              }
+            },
+            "uri": bar_py,
+          },
+          "name": "x"
+        }]),
     );
 }
 

@@ -8,23 +8,22 @@ use std::rc::Rc;
 use std::sync::atomic::AtomicI64;
 use std::sync::{Arc, RwLock};
 
-use anyhow::bail;
-use config::ProjectOptions;
+use config::{Mode, ModeChoice, ProjectOptions};
 use crossbeam_channel::{Receiver, Sender, never, select};
-use fluent_uri::Scheme;
 use lsp_server::{Connection, ExtractError, Message, Request};
 use lsp_types::notification::Notification as _;
-use lsp_types::{TextDocumentPositionParams, Uri};
+use lsp_types::{TextDocumentPositionParams, Url};
 use notify::EventKind;
 use serde::{Serialize, de::DeserializeOwned};
 use vfs::{LocalFS, NormalizedPath, NotifyEvent, PathWithScheme, VfsHandler as _};
 use zuban_python::{PanicRecovery, Project, RunCause};
 
 use crate::capabilities::{ClientCapabilities, server_capabilities};
+use crate::client_config::{ClientConfig, TypeCheckingMode};
 use crate::notebooks::Notebooks;
 use crate::notification_handlers::TestPanic;
-use crate::panic_hooks;
 use crate::request_handlers::to_uri;
+use crate::{Cli, custom, panic_hooks};
 
 // Since we currently don't do garbage collection, we simply delete the project and reindex,
 // because it's not that expensive after a specific amount of diagnostics.
@@ -37,6 +36,7 @@ fn version() -> &'static str {
 }
 
 pub fn run_server_with_custom_connection(
+    _cli_options: Cli,
     connection: Connection,
     typeshed_path: Option<Arc<NormalizedPath>>,
     cleanup: impl FnOnce() -> anyhow::Result<()>,
@@ -60,6 +60,7 @@ pub fn run_server_with_custom_connection(
         capabilities,
         workspace_folders,
         client_info,
+        initialization_options,
         ..
     } = from_json::<lsp_types::InitializeParams>("InitializeParams", &initialize_params)?;
 
@@ -97,8 +98,18 @@ pub fn run_server_with_custom_connection(
         }
     };
 
+    let client_config: ClientConfig = match initialization_options {
+        Some(initialization_options) => serde_json::from_value(initialization_options)
+            .unwrap_or_else(|err| {
+                tracing::error!(
+                    "Tried to parse user provided initializationOptions, but got: {err}"
+                );
+                Default::default()
+            }),
+        None => Default::default(),
+    };
     let client_capabilities = ClientCapabilities::new(capabilities);
-    let server_capabilities = server_capabilities(&client_capabilities);
+    let server_capabilities = server_capabilities(&client_capabilities, &client_config);
 
     let initialize_result = lsp_types::InitializeResult {
         capabilities: server_capabilities,
@@ -179,6 +190,7 @@ pub fn run_server_with_custom_connection(
     }));
 
     let mut global_state = GlobalState::new(
+        client_config,
         &connection.sender,
         client_capabilities,
         workspace_roots.clone(),
@@ -191,12 +203,12 @@ pub fn run_server_with_custom_connection(
     Ok(())
 }
 
-pub fn run_server() -> anyhow::Result<()> {
+pub fn run_server(cli_options: Cli) -> anyhow::Result<()> {
     // TODO reenable this in the alpha in some form
     //licensing::verify_license_in_config_dir()?;
 
     let (connection, _io_threads) = Connection::stdio();
-    run_server_with_custom_connection(connection, None, || {
+    run_server_with_custom_connection(cli_options, connection, None, || {
         // This used to be a join, but that seems to never join in VSCode, no idea why.
         //Ok(io_threads.join()?)
         Ok(())
@@ -209,6 +221,7 @@ struct NotificationDispatcher<'a, 'sender> {
 }
 
 pub(crate) struct GlobalState<'sender> {
+    pub client_config: ClientConfig,
     paths_that_invalidate_whole_project: HashSet<PathBuf>,
     sender: &'sender Sender<lsp_server::Message>,
     roots: Rc<[String]>,
@@ -225,12 +238,14 @@ pub(crate) struct GlobalState<'sender> {
 
 impl<'sender> GlobalState<'sender> {
     fn new(
+        client_config: ClientConfig,
         sender: &'sender Sender<lsp_server::Message>,
         client_capabilities: ClientCapabilities,
         roots: Rc<[String]>,
         typeshed_path: Option<Arc<NormalizedPath>>,
     ) -> Self {
         GlobalState {
+            client_config,
             paths_that_invalidate_whole_project: Default::default(),
             sender,
             roots,
@@ -296,7 +311,12 @@ impl<'sender> GlobalState<'sender> {
                 .first()
                 .expect("There should always be at least one root at this point");
             let first_root = vfs_handler.unchecked_abs_path(first_root);
-            let mut config = config::find_workspace_config(&vfs_handler, first_root.clone(), |path| {
+            let mode = match self.client_config.type_checking_mode {
+                TypeCheckingMode::Auto | TypeCheckingMode::Off => ModeChoice::Auto,
+                TypeCheckingMode::Default => ModeChoice::Implicit(Mode::Default),
+                TypeCheckingMode::Mypy => ModeChoice::Implicit(Mode::Mypy),
+            };
+            let mut config = config::find_config(&vfs_handler, first_root.clone(), None, mode, |path| {
                 // Watch the file itself to make sure that we can invalidate when it changes.
                 let path = Path::new(&**path);
                 vfs_handler.watch(path);
@@ -320,6 +340,12 @@ impl<'sender> GlobalState<'sender> {
                         "Canonicalizing of path that invalidates the whole project failed: {err}"
                     ),
                 }
+            }).map(|mut found| {
+                found.project_options
+                    .settings
+                    .mypy_path
+                    .push(vfs_handler.normalize_rc_path(found.most_probable_base));
+                found.project_options
             })
             .unwrap_or_else(|err| {
                 use lsp_types::{
@@ -349,13 +375,41 @@ impl<'sender> GlobalState<'sender> {
             //
             // It's questionable that we want those two things. And maybe there will also be a need
             // for the type checker to understand what the mypy_path originally was.
-            config.settings.mypy_path.extend(
-                self.roots
+
+            // For now we simply add paths if they are not a subfolder of the found mypy_path. We
+            // could do this in different ways, but we don't really trust that the workspace folder
+            // provided by LSP is correct. VSCode might be better than other clients, but I have
+            // seen cases where it's definitely wrong, so we prefer our own mechanism over LSP.
+            for root in self.roots.iter() {
+                let new_path = vfs_handler.normalize_unchecked_abs_path(root);
+                if config
+                    .settings
+                    .mypy_path
                     .iter()
-                    .map(|p| vfs_handler.normalize_unchecked_abs_path(p)),
-            );
+                    .any(|p| p.contains_sub_file(new_path.as_ref()))
+                {
+                    continue;
+                }
+                tracing::info!(
+                    "Added the mypy path {root}, because it's not part of the found paths"
+                );
+                config.settings.mypy_path.push(new_path)
+            }
             if self.typeshed_path.is_some() {
                 config.settings.typeshed_path = self.typeshed_path.clone();
+            }
+            if let Some(executable) = &self.client_config.python_executable {
+                if let Err(err) = config.settings.apply_python_executable(
+                    &vfs_handler,
+                    &first_root,
+                    None,
+                    executable,
+                ) {
+                    tracing::error!("Was not able to apply {err}")
+                }
+                tracing::info!(
+                    "Using the python_executable {executable:?} provided by the initialization options"
+                );
             }
             config.settings.try_to_apply_environment_variables(
                 &vfs_handler,
@@ -434,6 +488,8 @@ impl<'sender> GlobalState<'sender> {
         .on_sync_mut::<SelectionRangeRequest>(GlobalState::selection_ranges)
         .on_sync_mut::<InlayHintRequest>(GlobalState::inlay_hints)
         .on_sync_mut::<Shutdown>(GlobalState::handle_shutdown)
+        .on_sync_mut::<Shutdown>(GlobalState::handle_shutdown)
+        .on_sync_mut::<custom::DisplayStatusRequest>(GlobalState::display_status)
         .finish();
     }
 
@@ -570,6 +626,7 @@ impl<'sender> GlobalState<'sender> {
         {
             //self.poke_rust_analyzer_developer(format!("{}, check the log", err.message))
         }
+        tracing::trace!("Sending request: {response:?}");
         self.sender.send(response.into()).unwrap()
     }
 
@@ -633,14 +690,11 @@ impl<'sender> GlobalState<'sender> {
         }
     }
 
-    pub(crate) fn uri_to_path(
-        project: &Project,
-        uri: &lsp_types::Uri,
-    ) -> anyhow::Result<PathWithScheme> {
+    pub(crate) fn uri_to_path(project: &Project, uri: &Url) -> anyhow::Result<PathWithScheme> {
         let (scheme, path) = unpack_uri(uri)?;
         let handler = project.vfs_handler();
         let path = handler.unchecked_abs_path_from_uri(Arc::from(path));
-        Ok(if scheme.eq_lowercase("file") {
+        Ok(if scheme == "file" {
             let path = handler.normalize_rc_path(path);
             PathWithScheme::with_file_scheme(path)
         } else {
@@ -823,7 +877,7 @@ impl std::fmt::Display for LspError {
 
 impl std::error::Error for LspError {}
 
-fn patch_path_prefix(path: &Uri) -> anyhow::Result<String> {
+fn patch_path_prefix(path: &Url) -> anyhow::Result<String> {
     let (_, path) = unpack_uri(path)?;
     use std::path::{Component, Prefix};
     if cfg!(windows) {
@@ -861,41 +915,39 @@ fn patch_path_prefix(path: &Uri) -> anyhow::Result<String> {
     }
 }
 
-fn unpack_uri(uri: &lsp_types::Uri) -> anyhow::Result<(&Scheme, Cow<'_, str>)> {
-    let Some(scheme) = uri.scheme() else {
-        bail!("No scheme found in uri {}", uri.as_str())
+fn unpack_uri(uri: &Url) -> anyhow::Result<(&str, Cow<'_, str>)> {
+    let scheme = uri.scheme();
+    let Some(rest) = uri.as_str().strip_prefix(scheme) else {
+        unreachable!("{scheme:?} should always be a part of the URI {:?}", uri);
     };
-
-    let scheme_end = uri.scheme_end.expect("The scheme above is Some()");
-    let mut p = if let Some(auth) = &uri.auth {
-        uri.as_str().get(auth.start.get().get() as usize..).unwrap()
-    } else {
-        // + 1 for the colon in file:/
-        uri.as_str().get(scheme_end.get() as usize + 1..).unwrap()
-    };
+    let rest = rest.strip_prefix(':').unwrap_or(rest);
+    let mut rest = rest.strip_prefix("//").unwrap_or(rest);
     if cfg!(windows)
-        && let Some(new_p) = p.strip_prefix('/')
+        && let Some(new_p) = rest.strip_prefix('/')
     {
-        p = new_p;
+        rest = new_p;
     }
-
-    let decoded = urlencoding::decode(p)?;
-    Ok((scheme, decoded))
+    Ok((scheme, urlencoding::decode(rest)?))
 }
 
-#[test]
-#[cfg(windows)]
-fn patch_path_prefix_works() {
-    use std::str::FromStr as _;
-    assert_eq!(
-        patch_path_prefix(&Uri::from_str(r"file:///c:/foo/bar").unwrap()).unwrap(),
-        r"C:\foo\bar",
-    );
-    // This doesn't seem to be possible with URIs and we therefore ignore it for now.
-    /*
-    assert_eq!(
-        &patch_path_prefix(&Uri::from_str(r"\\?\c:/foo/bar").unwrap()),
-        r"\\?\C:\foo\bar",
-    );
-    */
+#[cfg(test)]
+mod tests {
+    #[allow(unused_imports)]
+    use super::*;
+    #[test]
+    #[cfg(windows)]
+    fn patch_path_prefix_works() {
+        use std::str::FromStr as _;
+        assert_eq!(
+            patch_path_prefix(&Url::from_str(r"file:///c:/foo/bar").unwrap()).unwrap(),
+            r"C:\foo\bar",
+        );
+        // This doesn't seem to be possible with URIs and we therefore ignore it for now.
+        /*
+        assert_eq!(
+            &patch_path_prefix(&Uri::from_str(r"\\?\c:/foo/bar").unwrap()),
+            r"\\?\C:\foo\bar",
+        );
+        */
+    }
 }

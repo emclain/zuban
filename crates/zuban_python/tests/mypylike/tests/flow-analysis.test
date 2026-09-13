@@ -577,3 +577,126 @@ class Y:
     def f(self):
         reveal_type(self.x)  # N: Revealed type is "Any | None"
         return self.x.foo
+
+[case pydantic_mre_fix_non_deterministic_errors]
+# From GH #311
+[file pkg/pydantic.py]
+from typing import dataclass_transform, Literal, overload
+
+from abc import ABCMeta
+
+@overload
+def Field(pattern: Literal['foo']) -> str: ...
+@overload
+def Field(pattern: Literal['']) -> str: ...
+def Field(pattern):
+    raise NotImplementedError
+
+@dataclass_transform(field_specifiers=(Field,))
+class ModelMetaclass(ABCMeta):
+    pass
+
+class BaseModel(metaclass=ModelMetaclass):
+    name: str
+
+[file pkg/x.py]
+from pkg.z import MyModel
+
+x = MyModel(name="hello")
+
+[file pkg/z.py]
+from typing import Final
+from pkg.pydantic import BaseModel, Field
+
+_REGEX: Final = r''
+
+class MyModel(BaseModel):
+    name: str = Field(_REGEX)
+
+[case lazy_defined_property_should_not_crash]
+# flags: --mode default
+# From GH #380
+class C:
+    def __init__(self, n: int | None = None):
+        self.a = 0 if n else 1
+
+    def m(self):
+        self.a = 2
+        return self.a
+
+    n = property(m)
+
+reveal_type(C().n)  # N: Revealed type is "Any"
+reveal_type(C().a)  # N: Revealed type is "int"
+
+[case lazy_defined_property_should_not_crash2]
+# flags: --mode default
+class C:
+    def __init__(self, n: int | None = None):
+        self.a = 0 if n else 1
+
+    def m(self) -> int:
+        self.a = 2
+        self.b = self.a
+        return self.a
+
+    def n(self):
+        self.b = 3
+        return self.b
+
+    n2 = property(n)
+
+reveal_type(C().n2)  # N: Revealed type is "Any"
+reveal_type(C().a)  # N: Revealed type is "int"
+reveal_type(C().b)  # N: Revealed type is "int"
+
+[case better_reachability_for_operating_system_ifs]
+# flags: --warn-unreachable
+# From GH #537
+import sys
+
+def foo() -> str:
+    if sys.platform == "darwin":
+        return "mac"
+    if sys.platform == "linux":
+        return "linux"
+    class UnreachableClass: ...
+    return "win"
+
+def bar() -> str:
+    if sys.platform == "darwin":
+        return "mac"
+    if sys.platform == "linux":
+        return "linux"
+    else:
+        class UnreachableClass: ...
+        return "win"
+
+[case avoid_crash_for_complex_flow_analysis1]
+# From GH #264
+
+def f(d: dict[int, object], b: bool) -> None:
+    if isinstance(d[0], str):
+        y = d[1 if b else 2]
+
+[case avoid_crash_for_complex_flow_analysis2]
+# From #188
+from typing import Protocol, assert_type
+import m
+
+class P(Protocol):
+    def m(self) -> int:
+        ...
+
+def f(x: m.X, p: P):
+    y = p
+    if bool():
+        if bool():
+            y = x
+        assert_type(y, P)
+    assert_type(y, P)
+
+[file m.py]
+class X:
+    def m(self):
+        return 1

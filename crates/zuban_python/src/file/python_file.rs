@@ -8,7 +8,8 @@ use std::{
 };
 
 use config::{
-    DiagnosticConfig, FinalizedTypeCheckerFlags, IniOrTomlValue, TypeCheckerFlags, set_flag,
+    DiagnosticConfig, FinalizedTypeCheckerFlags, IgnoreFileReason, IniOrTomlValue,
+    TypeCheckerFlags, set_flag,
 };
 use parsa_python_cst::*;
 use utils::InsertOnlyVec;
@@ -26,7 +27,8 @@ use super::{
 use crate::{
     InputPosition,
     database::{
-        ComplexPoint, Database, Locality, Point, PointLink, Points, PythonProject, Specific,
+        ComplexPoint, Database, Locality, Point, PointKind, PointLink, Points, PythonProject,
+        Specific,
     },
     debug,
     diagnostics::{Diagnostic, Diagnostics, Issue, IssueKind},
@@ -77,6 +79,7 @@ pub(crate) struct SuperFile {
     // This is is the offset where the sub file starts if it's in the same file
     // It might also be part of a notebook and therefore be different files with different URIs.
     pub offset: Option<CodeIndex>,
+    pub ignore_diagnostics: bool,
 }
 
 impl SuperFile {
@@ -95,10 +98,18 @@ pub(crate) struct FileImport {
     pub in_global_scope: bool,
 }
 
+#[derive(Clone)]
+pub(crate) enum DunderAllState {
+    Simple(Box<[DbString]>),
+    // In some cases __all__ is modified in a dynamic complex way where we don't know the exact
+    // literals.
+    ComplexUnknown,
+}
+
 pub(crate) struct PythonFile {
     pub tree: Tree, // TODO should probably not be public
     pub symbol_table: SymbolTable,
-    maybe_dunder_all: OnceLock<Option<Box<[DbString]>>>, // For __all__
+    maybe_dunder_all: OnceLock<Option<DunderAllState>>, // For __all__
     pub points: Points,
     pub complex_points: ComplexValues,
     pub file_index: FileIndex,
@@ -108,7 +119,7 @@ pub(crate) struct PythonFile {
     pub sub_files: SubFiles,
     pub(crate) super_file: Option<SuperFile>,
     stub_cache: Option<StubCache>,
-    pub ignore_type_errors: bool,
+    pub ignore_type_errors: Option<IgnoreFileReason>,
     flags: Option<FinalizedTypeCheckerFlags>,
     pub(super) delayed_diagnostics: RwLock<VecDeque<DelayedDiagnostic>>,
 
@@ -204,6 +215,12 @@ impl File for PythonFile {
     fn diagnostics<'db>(&'db self, db: &'db Database) -> Box<[Diagnostic<'db>]> {
         if self
             .super_file
+            .is_some_and(|super_file| super_file.ignore_diagnostics)
+        {
+            return Default::default();
+        }
+        if self
+            .super_file
             .is_none_or(|super_file| !super_file.is_part_of_parent())
         {
             // The main file is responsible for calculating diagnostics of type comments,
@@ -291,31 +308,35 @@ impl<'db> PythonFile {
     ) -> Self {
         let is_stub = file_entry.name.ends_with(".pyi");
         let issues = Diagnostics::default();
-        let mut ignore_type_errors =
-            tree.has_type_ignore_at_start()
-                .unwrap_or_else(|ignore_code| {
-                    issues.add(Issue::from_start_stop(
-                        1,
-                        1,
-                        IssueKind::TypeIgnoreWithErrorCodeNotSupportedForModules {
-                            ignore_code: ignore_code.into(),
-                        },
-                        true,
-                    ));
-                    true
-                });
+        let mut ignore_type_errors = tree
+            .has_type_ignore_at_start()
+            .map(|has_ignore| has_ignore.then_some(IgnoreFileReason::TypeIgnoreAtTopOfFile))
+            .unwrap_or_else(|ignore_code| {
+                issues.add(Issue::from_start_stop(
+                    1,
+                    1,
+                    IssueKind::TypeIgnoreWithErrorCodeNotSupportedForModules {
+                        ignore_code: ignore_code.into(),
+                    },
+                    true,
+                ));
+                Some(IgnoreFileReason::TypeIgnoreAtTopOfFile)
+            });
         let directives_info = info_from_directives(
             project,
             file_entry,
             &issues,
             tree.mypy_inline_config_directives(),
         );
-        ignore_type_errors |= match &directives_info.flags {
-            Some(flags) => flags.ignore_errors,
-            None => project.flags.ignore_errors,
-        };
+        if ignore_type_errors.is_none() {
+            ignore_type_errors = match &directives_info.flags {
+                Some(flags) => flags.ignore_errors,
+                None => project.flags.ignore_errors,
+            }
+        }
 
-        if !ignore_type_errors && let Some(issue) = add_error_if_typeshed_is_overwritten(file_entry)
+        if ignore_type_errors.is_none()
+            && let Some(issue) = add_error_if_typeshed_is_overwritten(file_entry)
         {
             issues.add(Issue::from_node_index(&tree, 0, issue, false));
         }
@@ -340,7 +361,7 @@ impl<'db> PythonFile {
         is_stub: bool,
         flags: Option<TypeCheckerFlags>,
         project: &PythonProject,
-        ignore_type_errors: bool,
+        ignore_type_errors: Option<IgnoreFileReason>,
     ) -> Self {
         let flags = flags.map(|flags| flags.finalize());
         let complex_points = Default::default();
@@ -444,6 +465,10 @@ impl<'db> PythonFile {
         (entry, is_package_name(entry))
     }
 
+    pub fn has_calculated_diagnostics(&self) -> bool {
+        self.points.get(0).calculated() && self.delayed_diagnostics.read().unwrap().is_empty()
+    }
+
     pub fn ensure_calculated_diagnostics(&self, db: &Database) -> Result<(), ()> {
         self.inference(&InferenceState::new(db, self))
             .calculate_module_diagnostics()
@@ -458,7 +483,17 @@ impl<'db> PythonFile {
         &self,
         db: &'db Database,
         start: CodeIndex,
+        code: Cow<str>,
+    ) -> &'db Self {
+        self.ensure_sub_file(db, start, code, false)
+    }
+
+    pub fn ensure_sub_file(
+        &self,
+        db: &'db Database,
+        start: CodeIndex,
         mut code: Cow<str>,
+        ignore_diagnostics: bool,
     ) -> &'db Self {
         if let Some(sub_file_index) = self.sub_files.lookup_sub_file_at_position(start) {
             return db.loaded_python_file(sub_file_index);
@@ -484,6 +519,7 @@ impl<'db> PythonFile {
             file.super_file = Some(SuperFile {
                 file: self.file_index,
                 offset: Some(start),
+                ignore_diagnostics,
             });
             file
         });
@@ -513,6 +549,11 @@ impl<'db> PythonFile {
         self.stub_cache.is_some()
     }
 
+    #[inline]
+    pub fn is_builtins(&self, db: &Database) -> bool {
+        self.file_index == db.python_state.builtins().file_index
+    }
+
     pub fn normal_file_of_stub_file(&self, db: &'db Database) -> Option<&'db PythonFile> {
         let stub_cache = self.stub_cache.as_ref()?;
         let file_index = *stub_cache.non_stub.get_or_init(|| {
@@ -533,8 +574,7 @@ impl<'db> PythonFile {
                     assert_ne!(file_index, self.file_index);
                     Some(file_index)
                 }
-                ImportResult::Namespace(_) => None,
-                ImportResult::PyTypedMissing => unreachable!(),
+                _ => None,
             }
         });
         db.ensure_file_for_file_index(file_index?).ok()
@@ -558,8 +598,7 @@ impl<'db> PythonFile {
         } else {
             match ImportResult::import_stub_for_non_stub_package(db, self, parent_dir, name)? {
                 ImportResult::File(file_index) => file_index,
-                ImportResult::Namespace(_) => return None,
-                ImportResult::PyTypedMissing => unreachable!(),
+                _ => return None,
             }
         };
         let loaded = db.ensure_file_for_file_index(file_index).ok()?;
@@ -570,12 +609,12 @@ impl<'db> PythonFile {
         Some(loaded)
     }
 
-    pub fn maybe_dunder_all(&self, db: &Database) -> Option<&[DbString]> {
+    pub fn maybe_dunder_all(&self, db: &Database) -> Option<&DunderAllState> {
         self.maybe_dunder_all
             .get_or_init(|| {
                 self.symbol_table
                     .lookup_symbol("__all__")
-                    .and_then(|dunder_all_index| {
+                    .map(|dunder_all_index| {
                         let name_def = NodeRef::new(self, dunder_all_index)
                             .expect_name()
                             .name_def()
@@ -587,7 +626,10 @@ impl<'db> PythonFile {
                                     assignment.maybe_simple_type_expression_assignment()
                                 })
                         {
-                            let base = maybe_dunder_all_names(vec![], self.file_index, expr)?;
+                            let Some(base) = maybe_dunder_all_names(vec![], self.file_index, expr)
+                            else {
+                                return DunderAllState::ComplexUnknown;
+                            };
                             self.gather_dunder_all_modifications(db, dunder_all_index, base)
                         } else if let Some(NameImportParent::ImportFromAsName(as_name)) =
                             name_def.maybe_import()
@@ -600,28 +642,52 @@ impl<'db> PythonFile {
                             // exactly this method.
                             let name_def_point =
                                 NodeRef::new(self, as_name.name_def().index()).point();
-                            let base = name_def_point
+                            if !name_def_point.calculated()
+                                || name_def_point.kind() != PointKind::Redirect
+                            {
+                                // This happens when the import is not resolvable, e.g. __all__
+                                // does not exist in the imported file.
+                                return DunderAllState::ComplexUnknown;
+                            }
+                            let Some(base) = name_def_point
                                 .as_redirected_node_ref(db)
                                 .file
-                                .maybe_dunder_all(db)?;
-                            self.gather_dunder_all_modifications(db, dunder_all_index, base.into())
+                                .maybe_dunder_all(db)
+                            else {
+                                // Not sure if this ever happens
+                                return DunderAllState::ComplexUnknown;
+                            };
+                            match base {
+                                DunderAllState::Simple(base) => self
+                                    .gather_dunder_all_modifications(
+                                        db,
+                                        dunder_all_index,
+                                        base.clone().into_vec(),
+                                    ),
+                                DunderAllState::ComplexUnknown => DunderAllState::ComplexUnknown,
+                            }
                         } else {
-                            None
+                            DunderAllState::ComplexUnknown
                         }
                     })
             })
-            .as_deref()
+            .as_ref()
     }
 
     pub fn is_name_exported_for_star_import(&self, db: &Database, name: &str) -> bool {
         if let Some(dunder) = self.maybe_dunder_all(db) {
-            // Name not in __all__
-            if !dunder.iter().any(|x| x.as_str(db) == name) {
-                debug!(
-                    "Name {name} found in star imports of {}, but it's not in __all__",
-                    self.file_path(db)
-                );
-                return false;
+            match dunder {
+                DunderAllState::Simple(dunder) => {
+                    // Name not in __all__
+                    if !dunder.iter().any(|x| x.as_str(db) == name) {
+                        debug!(
+                            "Name {name} found in star imports of {}, but it's not in __all__",
+                            self.file_path(db)
+                        );
+                        return false;
+                    }
+                }
+                DunderAllState::ComplexUnknown => return true,
             }
         } else if name.starts_with('_') {
             return false;
@@ -634,7 +700,7 @@ impl<'db> PythonFile {
         db: &Database,
         dunder_all_index: NodeIndex,
         mut dunder_all: Vec<DbString>,
-    ) -> Option<Box<[DbString]>> {
+    ) -> DunderAllState {
         let file_index = self.file_index;
         let check_multi_def = |dunder_all: Vec<DbString>, name: Name| -> Option<Vec<DbString>> {
             let name_def = name.name_def().unwrap();
@@ -689,17 +755,25 @@ impl<'db> PythonFile {
         if p.calculated() && p.maybe_specific() == Some(Specific::FirstNameOfNameDef) {
             for index in OtherDefinitionIterator::new(&self.points, dunder_all_index) {
                 let name = NodeRef::new(self, index as NodeIndex).expect_name();
-                dunder_all = check_multi_def(dunder_all, name)?
+                if let Some(new) = check_multi_def(dunder_all, name) {
+                    dunder_all = new
+                } else {
+                    return DunderAllState::ComplexUnknown;
+                }
             }
         }
         for (index, point) in self.points.iter().enumerate() {
             if point.maybe_redirect_to(PointLink::new(file_index, dunder_all_index))
                 && let Some(name) = NodeRef::new(self, index as NodeIndex).maybe_name()
             {
-                dunder_all = check_ref(dunder_all, name)?
+                if let Some(new) = check_ref(dunder_all, name) {
+                    dunder_all = new
+                } else {
+                    return DunderAllState::ComplexUnknown;
+                }
             }
         }
-        Some(dunder_all.into())
+        DunderAllState::Simple(dunder_all.into())
     }
 
     pub fn file_entry(&self, db: &'db Database) -> &'db Arc<FileEntry> {
@@ -741,7 +815,7 @@ impl<'db> PythonFile {
     ) -> bool {
         // This function adds issues in all normal cases and does not respect the InferenceState
         // mode.
-        if self.ignore_type_errors {
+        if self.ignore_type_errors.is_some() {
             return false;
         }
         let (file, add) = match self.super_file {
@@ -821,7 +895,7 @@ impl<'db> PythonFile {
             star_import.in_module_scope()
                 && self
                     .star_import_file(db, star_import)
-                    .is_some_and(|file| file.has_unsupported_class_scoped_import(db))
+                    .is_ok_and(|file| file.has_unsupported_class_scoped_import(db))
         })
     }
 
@@ -870,7 +944,7 @@ impl<'db> PythonFile {
 
     pub fn is_part_of_super_file(&self) -> bool {
         self.super_file
-            .is_some_and(|super_file| super_file.offset.is_some())
+            .is_some_and(|super_file| super_file.is_part_of_parent())
     }
 }
 
@@ -945,7 +1019,11 @@ fn info_from_directives<'x>(
                     Some(value) => IniOrTomlValue::Ini(value),
                     None => IniOrTomlValue::InlineConfigNoValue,
                 };
-                set_flag(flags.as_mut().unwrap(), &name, value, true)?;
+                let mut_flags = flags.as_mut().unwrap();
+                set_flag(mut_flags, &name, value, true)?;
+                if name == "ignore_errors" && mut_flags.ignore_errors.is_some() {
+                    mut_flags.ignore_errors = Some(IgnoreFileReason::IgnoreErrorsAtTopOfFile);
+                }
                 Ok(())
             };
             if let Err(err) = check() {

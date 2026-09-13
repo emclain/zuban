@@ -1,18 +1,19 @@
-use std::sync::Arc;
+use std::{borrow::Cow, sync::Arc};
+
+use utils::FastHashSet;
 
 use super::{
-    CallableContent, ClassGenerics, FunctionOverload, Tuple, Type, TypeVarKind, TypeVarLike,
-    UnionType, WithUnpack,
+    CallableContent, ClassGenerics, FunctionOverload, Tuple, Type, TypeVarKind, UnionType,
+    WithUnpack,
 };
 use crate::{
     database::MetaclassState,
     debug,
     file::ClassNodeRef,
+    format_data::FormatData,
     inference_state::InferenceState,
     match_::{Match, MismatchReason},
-    matching::{
-        ErrorStrs, ErrorTypes, GotType, Matcher, avoid_protocol_recursion, format_got_expected,
-    },
+    matching::{ErrorStrs, ErrorTypes, GotType, Matcher, format_got_expected},
     params::matches_params,
     recoverable_error,
     type_::{
@@ -20,6 +21,7 @@ use crate::{
         TupleUnpack, Variance,
     },
     type_helpers::{Class, TypeOrClass},
+    utils::debug_indent,
 };
 
 impl Type {
@@ -65,15 +67,9 @@ impl Type {
                     _ => Match::new_false(),
                 },
                 _ => match t1.as_ref() {
-                    Type::Any(_)
-                        if value_type
-                            .maybe_class(i_s.db)
-                            .is_some_and(|c| c.is_metaclass(i_s.db)) =>
-                    {
-                        Match::True {
-                            with_any: matcher.is_matching_reverse(),
-                        }
-                    }
+                    Type::Any(_) if value_type.is_metaclass(i_s.db) => Match::True {
+                        with_any: matcher.is_matching_reverse(),
+                    },
                     _ => Match::new_false(),
                 },
             },
@@ -87,7 +83,11 @@ impl Type {
             Type::Any(cause) => {
                 matcher.set_all_contained_type_vars_to_any(value_type, *cause);
                 Match::True {
-                    with_any: matcher.is_matching_reverse() && !matches!(value_type, Type::Any(_)),
+                    with_any: matcher.is_matching_reverse()
+                        && !(matches!(value_type, Type::Any(_))
+                            // Never is a subtype of all types.
+                            || variance == Variance::Covariant
+                                && matches!(value_type, Type::Never(_))),
                 }
             }
             Type::Never(_) => matches!(value_type, Type::Never(_)).into(),
@@ -139,25 +139,39 @@ impl Type {
             original_t1 @ Type::RecursiveType(rec1) => {
                 if let Some(t1) = rec1.calculated_type_if_ready(i_s.db) {
                     matcher.avoid_recursion(original_t1, value_type, |matcher| {
-                        match value_type {
-                            Type::Class(_) | Type::RecursiveType(_) => {
-                                // Classes like aliases can also be recursive in mypy, like
-                                // `class B(List[B])`.
-                                if let Type::RecursiveType(rec2) = value_type
-                                    && rec1.link == rec2.link
-                                    && let Some(t2) = rec2.calculated_type_if_ready(i_s.db)
-                                {
-                                    // Here we try to align the types. If they have the same link
-                                    // we should probably unpack them at the same time, because
-                                    // otherwise some TypeVars might match in weird ways and create
-                                    // weird unnecessary unions.
-                                    t1.matches(i_s, matcher, t2, variance)
-                                } else {
-                                    t1.matches(i_s, matcher, value_type, variance)
+                        matcher.cache_match_result(
+                            i_s.db,
+                            original_t1,
+                            value_type,
+                            variance,
+                            |matcher| {
+                                let _indent = debug_indent();
+                                debug!(
+                                    "Match recursive: {} against {}",
+                                    original_t1.format_short(i_s.db),
+                                    value_type.format_short(i_s.db)
+                                );
+                                match value_type {
+                                    Type::Class(_) | Type::RecursiveType(_) => {
+                                        // Classes like aliases can also be recursive in mypy, like
+                                        // `class B(List[B])`.
+                                        if let Type::RecursiveType(rec2) = value_type
+                                            && rec1.link == rec2.link
+                                            && let Some(t2) = rec2.calculated_type_if_ready(i_s.db)
+                                        {
+                                            // Here we try to align the types. If they have the same link
+                                            // we should probably unpack them at the same time, because
+                                            // otherwise some TypeVars might match in weird ways and create
+                                            // weird unnecessary unions.
+                                            t1.matches(i_s, matcher, t2, variance)
+                                        } else {
+                                            t1.matches(i_s, matcher, value_type, variance)
+                                        }
+                                    }
+                                    _ => t1.matches(i_s, matcher, value_type, variance),
                                 }
-                            }
-                            _ => t1.matches(i_s, matcher, value_type, variance),
-                        }
+                            },
+                        )
                     })
                 } else {
                     // Happens for example when creating the MRO of a class with a
@@ -184,9 +198,23 @@ impl Type {
             },
             Type::TypedDict(d1) => match value_type {
                 Type::TypedDict(d2) => {
-                    let mut m = d1.is_super_type_of(i_s, matcher, d2);
+                    if d1.defined_at == d2.defined_at && d1.generics.is_empty() {
+                        // This is a shortcut that might happen pretty often
+                        return Match::new_true();
+                    }
+                    let mut m = matcher.avoid_structural_matching_recursion(
+                        i_s.db,
+                        self,
+                        value_type,
+                        |matcher| d1.is_super_type_of(i_s, matcher, d2),
+                    );
                     if variance == Variance::Invariant {
-                        m &= d2.is_super_type_of(i_s, matcher, d1);
+                        m &= matcher.avoid_structural_matching_recursion(
+                            i_s.db,
+                            value_type,
+                            self,
+                            |matcher| d2.is_super_type_of(i_s, matcher, d1),
+                        )
                     }
                     m.similar_if_false()
                 }
@@ -225,9 +253,16 @@ impl Type {
                 _ => Match::new_false(),
             },
             Type::CustomBehavior(_) | Type::DataclassTransformObj(_) => Match::new_false(),
-            Self::Intersection(intersection1) => Match::all(intersection1.iter_entries(), |t| {
-                t.matches(i_s, matcher, value_type, variance)
-            }),
+            Self::Intersection(intersection1) => {
+                if variance == Variance::Invariant {
+                    self.is_super_type_of(i_s, matcher, value_type)
+                        & self.is_sub_type_of(i_s, matcher, value_type)
+                } else {
+                    Match::all(intersection1.iter_entries(), |t| {
+                        t.matches(i_s, matcher, value_type, variance)
+                    })
+                }
+            }
             Self::LiteralString { .. } => match value_type {
                 Self::LiteralString { .. } => Match::new_true(),
                 Self::Literal(l) => match &l.kind {
@@ -237,12 +272,11 @@ impl Type {
                 _ => Match::new_false(),
             },
             Self::TypeForm(tf1) => match value_type {
-                Self::TypeForm(t2) | Self::Type(t2) => {
-                    tf1.matches_internal(i_s, matcher, t2, variance)
-                }
+                Self::TypeForm(t2) | Self::Type(t2) => tf1.matches(i_s, matcher, t2, variance),
                 Self::None => tf1.matches_internal(i_s, matcher, &Self::None, variance),
                 _ => Match::new_false(),
             },
+            Self::Sentinel(_) => (self == value_type).into(),
         }
     }
 
@@ -351,12 +385,24 @@ impl Type {
                 if let Some(class1) = self.maybe_class(i_s.db)
                     && class1.is_protocol(i_s.db)
                 {
-                    avoid_protocol_recursion(
+                    let value_type = if let Type::Literal(l) = value_type {
+                        // If there are literals involved, we can simply check protocols without
+                        // the literals. This makes cases much better where we need to check 100+
+                        // literals, where we can simply use the cache in this case.
+                        //
+                        // Note: This could in theory be a problem if typeshed ever adds some
+                        // method that returns Self on a literal. This is probably unlikely,
+                        // because I don't know of such a method, but in that case we might need to
+                        // change this.
+                        Cow::Owned(l.fallback_type(i_s.db))
+                    } else {
+                        Cow::Borrowed(value_type)
+                    };
+                    matcher.avoid_structural_matching_recursion(
                         i_s.db,
                         self,
-                        value_type,
-                        matcher.has_type_var_matcher(),
-                        || class1.check_protocol_match(i_s, matcher, value_type),
+                        &value_type,
+                        |matcher| class1.check_protocol_match(i_s, matcher, &value_type),
                     )
                 } else {
                     Match::new_false()
@@ -526,7 +572,7 @@ impl Type {
                     m
                 }
             }
-            Type::Intersection(intersection2) => {
+            Type::Intersection(intersection2) if variance == Variance::Covariant => {
                 Match::any(intersection2.iter_entries(), |t| {
                     self.matches(i_s, matcher, t, variance)
                 })
@@ -595,13 +641,48 @@ impl Type {
                 if !u1.might_have_type_vars && !u2.might_have_type_vars && u1 == u2 {
                     return Match::new_true();
                 }
-                Match::all(u2.iter(), |g2| {
+                debug!("Match union against union");
+                let _indent = debug_indent();
+                const MAX_UNION_WITHOUT_HASHING: usize = 5;
+                let check = |matcher: &mut Matcher, g2: &_| {
                     if matches!(g2, Type::None) && i_s.should_ignore_none_in_untyped_context() {
                         Match::new_true()
                     } else {
                         self.union_is_super_type_of(i_s, matcher, u1, g2)
                     }
-                })
+                };
+                if u1.entries.len() > MAX_UNION_WITHOUT_HASHING
+                    && u2.entries.len() > MAX_UNION_WITHOUT_HASHING
+                {
+                    let literals1: FastHashSet<_> = u1
+                        .iter()
+                        .filter_map(|t| match t {
+                            Type::Literal(l) => Some(l.value(i_s.db)),
+                            _ => None,
+                        })
+                        .collect();
+                    let non_literals1: Vec<_> = u1
+                        .iter()
+                        .filter(|t| !matches!(t, Type::Literal(_)))
+                        .collect();
+                    Match::all(u2.iter(), |g2| {
+                        if let Type::Literal(l2) = g2 {
+                            if literals1.contains(&l2.value(i_s.db)) {
+                                Match::new_true()
+                            } else if non_literals1.is_empty() {
+                                Match::new_false()
+                            } else {
+                                Match::any(non_literals1.iter(), |g1| {
+                                    g1.is_super_type_of(i_s, matcher, g2)
+                                })
+                            }
+                        } else {
+                            check(matcher, g2)
+                        }
+                    })
+                } else {
+                    Match::all(u2.iter(), |g2| check(matcher, g2))
+                }
             }
             Type::Type(t) if matches!(t.as_ref(), Type::Union(_)) => {
                 let Type::Union(u) = t.as_ref() else {
@@ -615,6 +696,18 @@ impl Type {
             }
             Type::Class(c2)
                 if c2.link == i_s.db.python_state.bool_link() && u1.bool_literal_count() == 2 =>
+            {
+                Match::new_true()
+            }
+            Type::Enum(e2)
+                if u1
+                    .iter()
+                    .filter(|t| match t {
+                        Type::EnumMember(e1) => e1.enum_.defined_at == e2.defined_at,
+                        _ => false,
+                    })
+                    .count()
+                    == e2.members.len() =>
             {
                 Match::new_true()
             }
@@ -639,7 +732,38 @@ impl Type {
                         return m;
                     }
                 }
-                Match::any(u1.iter(), |g| g.is_super_type_of(i_s, matcher, value_type))
+                if matcher.is_matching_context && matcher.has_type_var_matcher() {
+                    // If we're matching the context we want to make sure that types are marked as
+                    // uninferrable if the union TypeVars differ. For normal matching we would need
+                    // o do something like this as well, but without some sort of backtracking or
+                    // advanced solving of type vars, it's just making results worse so we only use
+                    // it for the context.
+                    let mut result = Match::new_true();
+                    let mut matched = false;
+                    let value_type_has_type_vars = value_type.has_type_vars();
+                    for g in u1.iter() {
+                        if matched {
+                            if g.has_type_vars() || value_type_has_type_vars {
+                                // The result here is irrelevant, because one of the union entries
+                                // already matched. We only want to make sure the type vars
+                                // are matched.
+                                let mut new_matcher = matcher.clone();
+                                new_matcher.set_all_type_vars_uncalculated();
+                                g.is_super_type_of(i_s, &mut new_matcher, value_type);
+                                matcher.mark_mismatching_type_vars_uninferrable(i_s, new_matcher);
+                            }
+                        } else {
+                            let r = g.is_super_type_of(i_s, matcher, value_type);
+                            matched |= r.bool();
+                            if !matches!(result, Match::False { similar: true, .. }) {
+                                result = r;
+                            }
+                        }
+                    }
+                    result
+                } else {
+                    Match::any(u1.iter(), |g| g.is_super_type_of(i_s, matcher, value_type))
+                }
             }
         }
     }
@@ -664,15 +788,10 @@ impl Type {
                 .zip(class2.generics().iter(i_s.db))
                 .zip(type_vars.iter())
             {
-                let v = match tv {
-                    TypeVarLike::TypeVar(t) if variance == Variance::Covariant => {
-                        t.inferred_variance(i_s.db, class1)
-                    }
-                    TypeVarLike::TypeVar(t) if variance == Variance::Contravariant => {
-                        t.inferred_variance(i_s.db, class1).invert()
-                    }
-                    TypeVarLike::TypeVar(_) => Variance::Invariant,
-                    TypeVarLike::TypeVarTuple(_) | TypeVarLike::ParamSpec(_) => Variance::Covariant,
+                let v = match variance {
+                    Variance::Covariant => tv.inferred_variance(i_s.db, class1),
+                    Variance::Invariant => Variance::Invariant,
+                    Variance::Contravariant => tv.inferred_variance(i_s.db, class1).invert(),
                 };
                 matches &= t1.matches(i_s, matcher, &t2, v);
             }
@@ -810,19 +929,29 @@ impl Type {
                 if class1.node_ref == i_s.db.python_state.dict_node_ref()
                     || class1.node_ref == i_s.db.python_state.mutable_mapping_node_ref()
                 {
-                    if let Some(got_value) = td.can_be_overwritten_with(i_s) {
-                        return class1.nth_type_argument(i_s.db, 0).is_same_type(
+                    let mut match_ = if let Some(got_value) = td.can_be_overwritten_with(i_s) {
+                        class1.nth_type_argument(i_s.db, 0).is_same_type(
                             i_s,
                             matcher,
                             &i_s.db.python_state.str_type(),
                         ) & class1
                             .nth_type_argument(i_s.db, 1)
-                            .is_same_type(i_s, matcher, got_value);
+                            .is_same_type(i_s, matcher, got_value)
+                    } else {
+                        Match::new_false()
+                    };
+                    if let Match::False { reason, .. } = &mut match_ {
+                        let from = match class1.node_ref == i_s.db.python_state.dict_node_ref() {
+                            false => "MutableMapping",
+                            true => "dict",
+                        };
+                        *reason = MismatchReason::TypedDictAgainstDictMatching { from }
                     }
+                    match_
                 } else if class1.node_ref == i_s.db.python_state.mapping_node_ref()
                     && td.has_extra_items(i_s.db)
                 {
-                    return class1.nth_type_argument(i_s.db, 0).is_same_type(
+                    class1.nth_type_argument(i_s.db, 0).is_same_type(
                         i_s,
                         matcher,
                         &i_s.db.python_state.str_type(),
@@ -830,9 +959,10 @@ impl Type {
                         i_s,
                         matcher,
                         &td.union_of_all_types(i_s),
-                    );
+                    )
+                } else {
+                    Match::new_false()
                 }
-                Match::new_false()
             }
             _ => Match::new_false(),
         }
@@ -871,8 +1001,8 @@ impl Type {
                 // To not break defaultdict partials, we run the normal code for a very specific
                 // case.
                 if has_type_var_matcher
-                    && let Some(Type::FunctionOverload(o)) =
-                        value_type.replace_type_var_likes(i_s.db, &mut |usage| {
+                    && let Some(Type::FunctionOverload(o)) = value_type
+                        .maybe_replace_type_var_likes(i_s.db, &mut |usage| {
                             overload
                                 .iter_functions()
                                 .any(|c| c.defined_at == usage.in_definition())
@@ -967,23 +1097,37 @@ pub fn match_tuple_type_arguments(
     tup2: &TupleArgs,
     variance: Variance,
 ) -> Match {
-    let m = match_tuple_type_arguments_internal(i_s, matcher, tup1, tup2, variance);
-    if !m.bool()
-        && matcher.has_type_var_matcher()
-        && matches!(
-            tup2,
-            TupleArgs::WithUnpack(WithUnpack {
-                unpack: TupleUnpack::TypeVarTuple(_),
-                ..
+    let m = if variance == Variance::Contravariant {
+        matcher.match_reverse(|matcher| {
+            match_tuple_type_arguments(i_s, matcher, tup2, tup1, variance.invert())
+        })
+    } else {
+        debug_assert_ne!(variance, Variance::Contravariant);
+        let m = match_tuple_type_arguments_internal(i_s, matcher, tup1, tup2, variance);
+        if !m.bool()
+            && matcher.has_type_var_matcher()
+            && matches!(
+                tup2,
+                TupleArgs::WithUnpack(WithUnpack {
+                    unpack: TupleUnpack::TypeVarTuple(_),
+                    ..
+                })
+            )
+        {
+            m.or(|| {
+                matcher.match_reverse(|matcher| {
+                    match_tuple_type_arguments_internal(i_s, matcher, tup2, tup1, variance.invert())
+                })
             })
-        )
-    {
-        return m.or(|| {
-            matcher.match_reverse(|matcher| {
-                match_tuple_type_arguments_internal(i_s, matcher, tup2, tup1, variance.invert())
-            })
-        });
-    }
+        } else {
+            m
+        }
+    };
+    debug!(
+        "Matched tuples {} against {}: {m:?}",
+        tup1.format(&FormatData::new_short(i_s.db)),
+        tup2.format(&FormatData::new_short(i_s.db))
+    );
     m
 }
 
@@ -1044,7 +1188,7 @@ pub fn match_arbitrary_len_vs_unpack(
                 i_s,
                 tvt,
                 TupleArgs::ArbitraryLen(t1.clone().into()),
-                variance,
+                variance.invert(),
             )
         }
         TupleUnpack::ArbitraryLen(inner_t2) => {
@@ -1108,21 +1252,23 @@ fn match_unpack_internal(
         }
         match_
     };
-    let check_type_var_tuple = |matcher: &mut Matcher, tvt, args: TupleArgs| {
+    let check_type_var_tuple = |matcher: &mut Matcher, tvt, args: TupleArgs, variance| {
         let m = matcher.match_or_add_type_var_tuple(i_s, tvt, args.clone(), variance);
-        if !m.bool()
-            && let Match::False { reason, .. } = &m
-            && let Some(on_mismatch) = on_mismatch
-        {
-            on_mismatch(
-                ErrorTypes {
-                    matcher: Some(matcher),
-                    reason,
-                    expected: &Type::Tuple(Tuple::new(TupleArgs::WithUnpack(with_unpack1.clone()))),
-                    got: GotType::Type(&Type::Tuple(Tuple::new(args))),
-                },
-                with_unpack1.before.len() as isize,
-            );
+        if let Match::False { reason, .. } = &m {
+            debug!("Unpack mismatch of TypeVarTuple");
+            if let Some(on_mismatch) = on_mismatch {
+                on_mismatch(
+                    ErrorTypes {
+                        matcher: Some(matcher),
+                        reason,
+                        expected: &Type::Tuple(Tuple::new(TupleArgs::WithUnpack(
+                            with_unpack1.clone(),
+                        ))),
+                        got: GotType::Type(&Type::Tuple(Tuple::new(args))),
+                    },
+                    with_unpack1.before.len() as isize,
+                );
+            }
         }
         m
     };
@@ -1142,6 +1288,7 @@ fn match_unpack_internal(
                 matches &= check_type(matcher, t1, t2, i as isize);
             }
             if (with_unpack1.before.len() + with_unpack1.after.len()) > ts2.len() {
+                debug!("Unpack mismatch because there was a fixed len and one side is too short");
                 if let Some(on_too_few_args) = on_too_few_args {
                     on_too_few_args()
                 }
@@ -1153,6 +1300,7 @@ fn match_unpack_internal(
                             matcher,
                             tvt,
                             TupleArgs::FixedLen(t2_iterator.map(|(_, t2)| t2.clone()).collect()),
+                            variance,
                         )
                     }
                     TupleUnpack::ArbitraryLen(inner_t1) => {
@@ -1190,6 +1338,7 @@ fn match_unpack_internal(
                     let len_before_1 = with_unpack1.before.len();
                     let len_before_2 = with_unpack2.before.len();
                     if len_before_1 > len_before_2 {
+                        debug!("Unpack mismatch because of different lengths");
                         if let Some(on_mismatch) = on_mismatch {
                             on_mismatch(
                                 ErrorTypes {
@@ -1206,6 +1355,7 @@ fn match_unpack_internal(
                         }
                         return Match::new_false();
                     } else if with_unpack1.after.len() > with_unpack2.after.len() {
+                        debug!("Unpack mismatch because one side is too short");
                         if let Some(on_too_few_args) = on_too_few_args {
                             on_too_few_args()
                         }
@@ -1219,6 +1369,7 @@ fn match_unpack_internal(
                             unpack: with_unpack2.unpack.clone(),
                             after: after2_it.cloned().collect(),
                         }),
+                        variance,
                     )
                 }
                 TupleUnpack::ArbitraryLen(inner_t1) => {
@@ -1234,6 +1385,7 @@ fn match_unpack_internal(
                                 matcher,
                                 tvt2,
                                 TupleArgs::ArbitraryLen(Arc::new(inner_t1.clone())),
+                                variance.invert(),
                             )
                         }
                         TupleUnpack::ArbitraryLen(inner_t2) => {
@@ -1248,12 +1400,19 @@ fn match_unpack_internal(
                 return Match::True { with_any: true };
             }
             if !with_unpack1.before.is_empty() || !with_unpack1.after.is_empty() {
+                debug!(
+                    "Unpack mismatch because there were before or after elements matching vs. arbitrary len"
+                );
                 return Match::new_false();
             }
             match &with_unpack1.unpack {
                 TupleUnpack::TypeVarTuple(tvt) => {
-                    matches &=
-                        check_type_var_tuple(matcher, tvt, TupleArgs::ArbitraryLen(t2.clone()))
+                    matches &= check_type_var_tuple(
+                        matcher,
+                        tvt,
+                        TupleArgs::ArbitraryLen(t2.clone()),
+                        variance,
+                    )
                 }
                 TupleUnpack::ArbitraryLen(_) => {
                     recoverable_error!(

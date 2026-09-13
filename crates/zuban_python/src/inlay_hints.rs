@@ -1,5 +1,3 @@
-use std::borrow::Cow;
-
 use lsp_types::InlayHintKind;
 use parsa_python_cst::{
     AssignmentContent, AssignmentRightSide, ExpressionContent, ExpressionPart, PotentialInlayHint,
@@ -44,16 +42,14 @@ impl<'project> Document<'project> {
                         return None;
                     }
                     let func = Function::new_with_unknown_parent(db, NodeRef::new(file, f.index()));
-                    let mut t = func.inferred_return_type(&InferenceState::new(db, file));
-                    if let Some(new_t) = t.replace_type_var_likes(db, &mut |usage| {
+                    let t = func.inferred_return_type(&InferenceState::new(db, file));
+                    let t = t.replace_type_var_likes(db, &mut |usage| {
                         if usage.as_type_var_like().is_untyped() {
                             Some(usage.as_any_generic_item())
                         } else {
                             None
                         }
-                    }) {
-                        t = Cow::Owned(new_t);
-                    }
+                    });
                     if t.is_any() {
                         return None;
                     }

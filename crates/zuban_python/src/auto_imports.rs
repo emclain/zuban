@@ -6,7 +6,8 @@ use std::{
 
 use config::ProjectOptions;
 use parsa_python_cst::{
-    CodeIndex, DottedImportName, DottedImportNameContent, Name, NameImportParent, Scope,
+    CodeIndex, DottedImportName, DottedImportNameContent, LevelWithDottedName, Name,
+    NameImportParent, Scope,
 };
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -179,11 +180,15 @@ impl<'db> ImportFinder<'db> {
                 NameImportParent::ImportFromAsName(from_as_name) => from_as_name
                     .import_from()
                     .is_some_and(|import_from| match import_from.level_with_dotted_name() {
-                        (0, Some(imp)) => {
+                        LevelWithDottedName {
+                            level: 0,
+                            names: Some(imp),
+                            ..
+                        } => {
                             let (_, is_package) = file.file_entry_and_is_package(self.db);
                             !(is_package || has_import_of_file(self.db, file, imp))
                         }
-                        (1, _) => false, // Imports from the same package are not private
+                        LevelWithDottedName { level: 1, .. } => false, // Imports from the same package are not private
                         // Levels bigger than two should not be public
                         _ => true,
                     }),
@@ -200,7 +205,7 @@ impl<'db> ImportFinder<'db> {
             if file
                 .name_resolution_for_types(&InferenceState::new(self.db, file))
                 .lookup_from_star_import(self.name, false)
-                .is_some()
+                .is_ok()
             {
                 self.found.lock().unwrap().push(PotentialImport {
                     file,
@@ -383,7 +388,9 @@ impl FileImport {
             ImportResult::File(file_index) => {
                 Some(file_to_kind(db, db.loaded_python_file(file_index)))
             }
-            ImportResult::PyTypedMissing => Some(ImportKind::ThirdParty),
+            ImportResult::PyTypedMissing(_) | ImportResult::BinaryExtension => {
+                Some(ImportKind::ThirdParty)
+            }
             ImportResult::Namespace(_) => None,
         };
         let node_ref = NodeRef::new(from_file, self.node_index);
@@ -636,7 +643,7 @@ fn has_import_of_file(db: &Database, file: &PythonFile, dotted: DottedImportName
         match result {
             ImportResult::File(file_index) => file_index == file.file_index,
             ImportResult::Namespace(_) => false,
-            ImportResult::PyTypedMissing => false,
+            ImportResult::PyTypedMissing(_) | ImportResult::BinaryExtension => false,
         }
     } else {
         false

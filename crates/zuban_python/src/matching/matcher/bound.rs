@@ -91,6 +91,27 @@ impl Bound {
         }
     }
 
+    pub fn debug_format(&self, db: &Database) -> Box<str> {
+        let format_data = &FormatData::new_short(db);
+        let formatted = self.format_with_fallback(format_data, ParamsStyle::CallableParams, |_| {
+            MatcherFormatResult::Str("?".into())
+        });
+        let MatcherFormatResult::Str(s) = formatted else {
+            unreachable!()
+        };
+        match self {
+            Bound::Uncalculated { .. } => s,
+            Bound::Invariant(_) => format!(":={s}").into(),
+            Bound::Upper(_) => format!("<:{s}").into(),
+            Bound::UpperAndLower(_, lower) => format!(
+                "{s} :> {}",
+                lower.format(format_data, ParamsStyle::CallableParams)
+            )
+            .into(),
+            Bound::Lower(_) => format!(":>{s}").into(),
+        }
+    }
+
     pub fn search_type_vars<C: FnMut(TypeVarLikeUsage) + ?Sized>(&self, found_type_var: &mut C) {
         let t = match self {
             Self::Invariant(t) | Self::Lower(t) | Self::Upper(t) => t,
@@ -115,7 +136,7 @@ impl Bound {
         Some(match self {
             Self::Invariant(t) => Self::Invariant(t.replace_type_var_likes(db, on_type_var_like)?),
             Self::Upper(t) => Self::Upper(t.replace_type_var_likes(db, on_type_var_like)?),
-            Self::Lower(t) => Self::Upper(t.replace_type_var_likes(db, on_type_var_like)?),
+            Self::Lower(t) => Self::Lower(t.replace_type_var_likes(db, on_type_var_like)?),
             Self::UpperAndLower(upper, lower) => {
                 let new_upper = upper.replace_type_var_likes(db, on_type_var_like);
                 let new_lower = lower.replace_type_var_likes(db, on_type_var_like);
@@ -128,7 +149,7 @@ impl Bound {
                 )
             }
             Self::Uncalculated { fallback: Some(t) } => Self::Uncalculated {
-                fallback: Some(t.replace_type_var_likes(db, on_type_var_like)?),
+                fallback: Some(t.maybe_replace_type_var_likes(db, on_type_var_like)?),
             },
             Self::Uncalculated { fallback: None } => Self::Uncalculated { fallback: None },
         })
@@ -199,13 +220,13 @@ impl Bound {
         }
     }
 
-    pub fn has_any(&self, i_s: &InferenceState) -> bool {
+    pub fn has_any(&self, db: &Database) -> bool {
         match self {
-            Self::Invariant(k) | Self::Upper(k) | Self::Lower(k) => k.has_any(i_s),
-            Self::UpperAndLower(upper, lower) => upper.has_any(i_s) || lower.has_any(i_s),
+            Self::Invariant(k) | Self::Upper(k) | Self::Lower(k) => k.has_any(db),
+            Self::UpperAndLower(upper, lower) => upper.has_any(db) || lower.has_any(db),
             Self::Uncalculated {
                 fallback: Some(fallback),
-            } => fallback.has_any(i_s),
+            } => fallback.has_any(db),
             Self::Uncalculated { fallback: None } => false,
         }
     }
@@ -271,16 +292,19 @@ impl BoundKind {
         self.simple_matches(i_s, other, Variance::Contravariant)
     }
 
-    pub(super) fn common_base_type(&self, i_s: &InferenceState, other: &Self) -> Option<Self> {
+    pub(super) fn common_base_type(
+        &self,
+        i_s: &InferenceState,
+        other: &Self,
+        use_joins: bool,
+    ) -> Option<Self> {
         match (self, other) {
-            (Self::TypeVar(t1), Self::TypeVar(t2)) => {
-                Some(Self::TypeVar(if i_s.flags().use_joins {
-                    t1.common_base_type(i_s, t2)
-                } else {
-                    t1.avoid_implicit_literal_cow(i_s.db)
-                        .simplified_union(i_s, &t2.avoid_implicit_literal_cow(i_s.db))
-                }))
-            }
+            (Self::TypeVar(t1), Self::TypeVar(t2)) => Some(Self::TypeVar(if use_joins {
+                t1.common_base_type(i_s, t2)
+            } else {
+                t1.avoid_implicit_literal_cow(i_s.db)
+                    .simplified_union(i_s, &t2.avoid_implicit_literal_cow(i_s.db))
+            })),
             (Self::TypeVarTuple(tup1), Self::TypeVarTuple(tup2)) => Some(Self::TypeVarTuple(
                 tup1.simplified_union_for_type_var_tuple(i_s, tup2)?,
             )),
@@ -340,23 +364,23 @@ impl BoundKind {
         on_type_var_like: &mut impl FnMut(TypeVarLikeUsage) -> Option<GenericItem>,
     ) -> Option<Self> {
         Some(match self {
-            Self::TypeVar(t) => Self::TypeVar(t.replace_type_var_likes(db, on_type_var_like)?),
-            Self::TypeVarTuple(tup) => {
-                Self::TypeVarTuple(tup.replace_type_var_likes(db, on_type_var_like)?)
+            Self::TypeVar(t) => {
+                Self::TypeVar(t.maybe_replace_type_var_likes(db, on_type_var_like)?)
             }
-            Self::ParamSpec(params) => Self::ParamSpec(params.replace_type_var_likes_and_self(
-                db,
-                on_type_var_like,
-                &|| None,
-            )?),
+            Self::TypeVarTuple(tup) => {
+                Self::TypeVarTuple(tup.maybe_replace_type_var_likes(db, on_type_var_like)?)
+            }
+            Self::ParamSpec(params) => Self::ParamSpec(
+                params.maybe_replace_type_var_likes_and_self(db, on_type_var_like, &|| None)?,
+            ),
         })
     }
 
-    fn has_any(&self, i_s: &InferenceState) -> bool {
+    fn has_any(&self, db: &Database) -> bool {
         match self {
-            Self::TypeVar(t) => t.has_any(i_s),
-            Self::TypeVarTuple(ts) => ts.has_any(i_s),
-            Self::ParamSpec(params) => params.has_any(i_s),
+            Self::TypeVar(t) => t.has_any(db),
+            Self::TypeVarTuple(ts) => ts.find_in_type(db, &mut |t| t.has_any(db)),
+            Self::ParamSpec(params) => params.has_any(db),
         }
     }
 
@@ -414,13 +438,9 @@ impl TupleArgs {
                     ts1.iter()
                         .zip(ts2.iter())
                         .map(|(t1, t2)| {
-                            if i_s.db.mypy_compatible() {
-                                Some(t1.simplified_union(i_s, t2))
-                            } else {
-                                t1.common_base_if_subtype(i_s, t2)
-                            }
+                            t1.simplified_union(i_s, t2)
                         })
-                        .collect::<Option<_>>()?,
+                        .collect(),
                 )
             }
             (TupleArgs::FixedLen(_), TupleArgs::FixedLen(_))
@@ -472,26 +492,5 @@ impl TupleArgs {
             )),
             _ => return None
         })
-    }
-}
-
-impl Type {
-    fn common_base_if_subtype(&self, i_s: &InferenceState, t2: &Self) -> Option<Self> {
-        // Conformance tests do not allow tuple merging for TypeVarTuples,
-        // we therefore only match subtypes.
-        if self.is_any() {
-            return Some(self.clone());
-        } else if t2.is_any() {
-            return Some(t2.clone());
-        }
-        let t1 = self.avoid_implicit_literal_cow(i_s.db);
-        let t2 = t2.avoid_implicit_literal_cow(i_s.db);
-        if t1.is_simple_super_type_of(i_s, &t2).bool() {
-            Some(t1.into_owned())
-        } else if t2.is_simple_super_type_of(i_s, &t1).bool() {
-            Some(t2.into_owned())
-        } else {
-            None
-        }
     }
 }

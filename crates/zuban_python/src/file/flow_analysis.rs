@@ -2,6 +2,7 @@ use std::{
     borrow::{Borrow, Cow},
     cell::{Cell, OnceCell, Ref, RefCell, RefMut},
     collections::VecDeque,
+    rc::Rc,
     sync::Arc,
 };
 
@@ -22,7 +23,8 @@ use parsa_python_cst::{
 use crate::{
     arguments::{KnownArgsWithCustomAddIssue, SimpleArgs},
     database::{
-        ComplexPoint, Database, Locality, Point, PointKind, PointLink, Specific, WidenedType,
+        ClassKind, ComplexPoint, Database, Locality, Point, PointKind, PointLink, Specific,
+        WidenedType,
     },
     debug,
     diagnostics::IssueKind,
@@ -42,10 +44,11 @@ use crate::{
         Enum, EnumKind, EnumMember, GenericClass, Intersection, Literal, LiteralKind, LookupResult,
         NamedTuple, NeverCause, StringSlice, Tuple, TupleArgs, TupleUnpack, Type, TypeVar,
         TypeVarKind, TypedDict, UnionEntry, UnionType, WithUnpack, lookup_on_enum_instance,
+        simplified_union_from_iterators_with_format_index,
     },
     type_helpers::{
         Callable, Class, ClassLookupOptions, FirstParamKind, Function, InstanceLookupOptions,
-        LookupDetails, OverloadResult, OverloadedFunction,
+        OverloadResult, OverloadedFunction,
     },
     utils::{EitherIterator, debug_indent},
 };
@@ -63,8 +66,79 @@ type ParentUnions = Vec<(FlowKey, UnionType)>;
 
 const MAX_PRECISE_TUPLE_SIZE: usize = 8; // Constant taken from Mypy
 
+pub const FLOW_ANALYSIS: FlowAnalysisHelper = FlowAnalysisHelper();
 thread_local! {
-    pub static FLOW_ANALYSIS: FlowAnalysis = FlowAnalysis::default();
+    static FLOW_ANALYSIS_INNER: RefCell<Rc<FlowAnalysis>> = RefCell::new(Rc::new(FlowAnalysis::default()));
+}
+
+pub struct FlowAnalysisHelper();
+
+impl FlowAnalysisHelper {
+    pub fn with<T>(&self, callback: impl FnOnce(&FlowAnalysis) -> T) -> T {
+        let fa = FLOW_ANALYSIS_INNER.with(|fa| fa.borrow().clone());
+        callback(&fa)
+    }
+
+    fn with_new_empty<T>(&self, db: &Database, callable: impl FnOnce(&FlowAnalysis) -> T) -> T {
+        let FlowAnalysisResult {
+            result,
+            unfinished_partials,
+        } = self.with_new_empty_without_unfinished_partial_checking(callable);
+        process_unfinished_partials(db, unfinished_partials);
+        result
+    }
+
+    pub fn with_new_empty_for_file<T>(
+        &self,
+        db: &Database,
+        file: &PythonFile,
+        callable: impl FnOnce(&FlowAnalysis) -> T,
+    ) -> T {
+        self.with_new_empty(db, |flow_analysis| {
+            debug_assert!(flow_analysis.delayed_diagnostics.borrow().is_empty());
+            *flow_analysis.delayed_diagnostics.borrow_mut() =
+                std::mem::take(&mut file.delayed_diagnostics.write().unwrap());
+            let result = callable(flow_analysis);
+            let mut delayed = flow_analysis.delayed_diagnostics.take();
+            if db.project.flags.local_partial_types {
+                let mut file_delayed = file.delayed_diagnostics.write().unwrap();
+                delayed.extend(file_delayed.drain(..));
+                *file_delayed = delayed;
+            } else {
+                flow_analysis.process_delayed_diagnostics(db, delayed)
+            }
+            result
+        })
+    }
+
+    pub fn with_new_empty_and_delay_further<T>(
+        &self,
+        db: &Database,
+        callable: impl FnOnce() -> T,
+    ) -> T {
+        let (result, delayed) = self.with_new_empty(db, |flow_analysis| {
+            let result = callable();
+            let delayed: VecDeque<_> =
+                std::mem::take(&mut flow_analysis.delayed_diagnostics.borrow_mut());
+            (result, delayed)
+        });
+        self.with(|fa| fa.delayed_diagnostics.borrow_mut().extend(delayed));
+        result
+    }
+
+    pub fn with_new_empty_without_unfinished_partial_checking<T>(
+        &self,
+        callable: impl FnOnce(&FlowAnalysis) -> T,
+    ) -> FlowAnalysisResult<T> {
+        let new = Rc::new(FlowAnalysis::default());
+        let old = FLOW_ANALYSIS_INNER.replace(new.clone());
+        let result = callable(&new);
+        let inner = FLOW_ANALYSIS_INNER.replace(old);
+        return FlowAnalysisResult {
+            result,
+            unfinished_partials: inner.partials_in_module.take(),
+        };
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -421,90 +495,6 @@ pub(crate) struct FlowAnalysis {
 }
 
 impl FlowAnalysis {
-    fn with_new_empty<T>(&self, db: &Database, callable: impl FnOnce() -> T) -> T {
-        let FlowAnalysisResult {
-            result,
-            unfinished_partials,
-        } = self.with_new_empty_without_unfinished_partial_checking(callable);
-        process_unfinished_partials(db, unfinished_partials);
-        result
-    }
-
-    pub fn with_new_empty_for_file<T>(
-        &self,
-        db: &Database,
-        file: &PythonFile,
-        callable: impl FnOnce() -> T,
-    ) -> T {
-        self.with_new_empty(db, || {
-            debug_assert!(self.delayed_diagnostics.borrow().is_empty());
-            *self.delayed_diagnostics.borrow_mut() =
-                std::mem::take(&mut file.delayed_diagnostics.write().unwrap());
-            let result = callable();
-            let mut delayed = self.delayed_diagnostics.take();
-            if db.project.flags.local_partial_types {
-                let mut file_delayed = file.delayed_diagnostics.write().unwrap();
-                delayed.extend(file_delayed.drain(..));
-                *file_delayed = delayed;
-            } else {
-                self.process_delayed_diagnostics(db, delayed)
-            }
-            result
-        })
-    }
-    pub fn with_new_empty_and_delay_further<T>(
-        &self,
-        db: &Database,
-        callable: impl FnOnce() -> T,
-    ) -> T {
-        let (result, delayed) = self.with_new_empty(db, || {
-            let result = callable();
-            let delayed: VecDeque<_> = std::mem::take(&mut self.delayed_diagnostics.borrow_mut());
-            (result, delayed)
-        });
-        self.delayed_diagnostics.borrow_mut().extend(delayed);
-        result
-    }
-
-    pub fn with_new_empty_without_unfinished_partial_checking<T>(
-        &self,
-        callable: impl FnOnce() -> T,
-    ) -> FlowAnalysisResult<T> {
-        if self.frames.try_borrow_mut().is_err() {
-            // TODO This is completely wrong, but is related to the test
-            // narrowing_with_key_in_different_file and executing narrows
-            return FlowAnalysisResult {
-                result: callable(),
-                unfinished_partials: Default::default(),
-            };
-        }
-        let old_frames = self.frames.take();
-        let try_frames = self.try_frames.take();
-        let loop_details = self.loop_details.take();
-        let delayed = self.delayed_diagnostics.take();
-        let partials = self.partials_in_module.take();
-        let in_type_checking_only_block = self.in_type_checking_only_block.take();
-        let accumulating_types = self.accumulating_types.take();
-        let in_pattern_matching = self.in_pattern_matching.take();
-
-        let result = FlowAnalysisResult {
-            result: callable(),
-            unfinished_partials: self.partials_in_module.take(),
-        };
-        self.debug_assert_is_empty();
-
-        *self.frames.borrow_mut() = old_frames;
-        *self.try_frames.borrow_mut() = try_frames;
-        *self.loop_details.borrow_mut() = loop_details;
-        *self.delayed_diagnostics.borrow_mut() = delayed;
-        *self.partials_in_module.borrow_mut() = partials;
-        self.in_type_checking_only_block
-            .set(in_type_checking_only_block);
-        self.accumulating_types.set(accumulating_types);
-        self.in_pattern_matching.set(in_pattern_matching);
-        result
-    }
-
     pub(crate) fn add_delayed_func_with_reused_narrowings_for_nested_function(
         &self,
         func_node_ref: FuncNodeRef,
@@ -547,17 +537,6 @@ impl FlowAnalysis {
                 in_type_checking_only_block: self.in_type_checking_only_block.get(),
                 reused_narrowings,
             }))
-    }
-
-    pub fn debug_assert_is_empty(&self) {
-        debug_assert!(self.frames.borrow().is_empty());
-        debug_assert!(self.try_frames.borrow().is_empty());
-        debug_assert!(self.loop_details.borrow().is_none());
-        debug_assert!(self.delayed_diagnostics.borrow().is_empty());
-        debug_assert!(self.partials_in_module.borrow().is_empty());
-        debug_assert!(!self.in_type_checking_only_block.get());
-        debug_assert!(!self.in_type_checking_only_block.get());
-        debug_assert_eq!(self.in_pattern_matching.get(), 0);
     }
 
     fn lookup_narrowed_key_and_deleted(
@@ -777,25 +756,24 @@ impl FlowAnalysis {
         i_s: &InferenceState,
         search_for: &Entry,
     ) -> Entry {
-        self.frames
-            .borrow()
-            .iter()
-            .rev()
-            .find_map(|frame| {
-                frame.entries.iter().find_map(|e| {
-                    if e.key.equals(i_s.db, &search_for.key) {
-                        return Some(e.union_of_refs(i_s, search_for));
-                    }
-                    None
-                })
-            })
+        // We have to use a separate way of borrowing frames and create a union, because that might
+        // need mutable access to frames again.
+        let found = self.frames.borrow().iter().rev().find_map(|frame| {
+            frame
+                .entries
+                .iter()
+                .find_map(|e| e.key.equals(i_s.db, &search_for.key).then(|| e.clone()))
+        });
+        if let Some(mut found) = found {
+            found.union(i_s, search_for, false);
+            found
+        } else {
             // The fallback just assigns an "empty" key. This is needed, because otherwise we would
             // not be able to know if the entry invalidated entries further up the stack.
-            .unwrap_or_else(|| {
-                search_for.with_declaration(
-                    i_s.flags().allow_redefinition || self.in_pattern_matching.get() > 0,
-                )
-            })
+            search_for.with_declaration(
+                i_s.flags().allow_redefinition || self.in_pattern_matching.get() > 0,
+            )
+        }
     }
 
     fn remove_key(&self, i_s: &InferenceState, key: &FlowKey) {
@@ -1040,19 +1018,10 @@ impl FlowAnalysis {
                             .map(|c| Class::with_self_generics(db, ClassNodeRef::from_link(db, c))),
                     );
                     let run = || {
-                        let i_s = if let Some(cls) = &func.class {
-                            InferenceState::from_class(db, cls)
-                        } else {
-                            InferenceState::new(db, func.node_ref.file)
-                        };
                         self.with_frame(
                             Frame::new(FrameKind::BaseScope, delayed_func.reused_narrowings),
                             || {
-                                let result = func
-                                    .node_ref
-                                    .file
-                                    .inference(&i_s)
-                                    .ensure_func_diagnostics(func);
+                                let result = func.ensure_func_diagnostics(db);
                                 debug_assert!(result.is_ok());
                             },
                         );
@@ -1321,11 +1290,20 @@ fn split_off_enum_member(
                     add(f);
                     continue;
                 }
+                let is_class = |link| match sub_t {
+                    Type::Class(c) => c.link == link,
+                    _ => false,
+                };
                 if abort_on_custom_eq
-                    && matches!(
-                        enum_member.enum_.kind(i_s),
-                        EnumKind::IntEnum | EnumKind::StrEnum
-                    )
+                    && match enum_member.enum_.kind(i_s) {
+                        EnumKind::IntEnum => {
+                            is_class(i_s.db.python_state.int_link()) || has_custom_eq(i_s, sub_t)
+                        }
+                        EnumKind::StrEnum => {
+                            is_class(i_s.db.python_state.str_link()) || has_custom_eq(i_s, sub_t)
+                        }
+                        _ => false,
+                    }
                 {
                     return None;
                 }
@@ -1385,6 +1363,11 @@ fn split_off_singleton(
                 }
                 _ => add(sub_t.clone()),
             },
+            Type::NewType(new_type) if is_eq => {
+                let (_, f) = split_off_singleton(i_s, &new_type.type_, singleton, is_eq);
+                truthy.union_in_place(sub_t.clone());
+                add(f);
+            }
             _ if singleton == sub_t => truthy.union_in_place(singleton.clone()),
             _ => {
                 if let Type::Literal(literal2) = singleton {
@@ -1472,11 +1455,10 @@ fn narrow_is_or_eq(
         // Mypy does only want to narrow if there are explicit literals on one side. See also
         // comments around testNarrowingEqualityFlipFlop.
         Type::Literal(literal1)
-            if is_eq
-                && (!literal1.implicit
-                    || key.is_simple_name() && !i_s.db.mypy_compatible()
-                    || has_explicit_literal(i_s.db, checking_t))
-                || !is_eq && matches!(literal1.kind, LiteralKind::Bool(_)) =>
+            if !is_eq
+                || !literal1.implicit
+                || key.is_simple_name() && !i_s.db.mypy_compatible()
+                || has_explicit_literal(i_s.db, checking_t) =>
         {
             let (true_type, false_type) = split_off_singleton(i_s, checking_t, other_t, is_eq);
             Some((
@@ -1493,6 +1475,7 @@ fn narrow_is_or_eq(
         Type::Class(c) if c.link == i_s.db.python_state.ellipsis_link() => {
             Some(split_singleton(key))
         }
+        Type::Sentinel(_) => Some(split_singleton(key)),
         _ => match checking_t {
             Type::Union(_) => {
                 // Remove None from the checking side, if the other side matches everything except None.
@@ -1580,27 +1563,37 @@ fn split_truthy_and_falsey_t(i_s: &InferenceState, t: &Type) -> Option<(Type, Ty
             LiteralKind::Int(i) => check(*i != 0.into()),
             _ => None,
         };
-        let narrow_by_return_literal = |l: LookupDetails| {
-            let inf = l.lookup.into_maybe_inferred()?;
-            Some(match inf.as_cow_type(i_s).maybe_callable(i_s)? {
-                CallableLike::Callable(c) => match &c.return_type {
-                    Type::Literal(literal) => check_literal(literal),
+
+        let check_class = |class: Class| {
+            let narrow_class_by_return_literal = |name| {
+                let l = match t {
+                    Type::EnumMember(e) => lookup_on_enum_instance(i_s, &|_| false, &e.enum_, name),
+                    Type::Enum(e) => lookup_on_enum_instance(i_s, &|_| false, e, name),
+                    _ => class.lookup(i_s, name, ClassLookupOptions::new(&|_| false)),
+                };
+                let inf = l.lookup.into_maybe_inferred()?;
+                Some(match inf.as_cow_type(i_s).maybe_callable(i_s)? {
+                    CallableLike::Callable(c) => match &c.return_type {
+                        Type::Literal(literal) => check_literal(literal),
+                        _ => None,
+                    },
                     _ => None,
-                },
-                _ => None,
-            })
+                })
+            };
+
+            if let Some(maybe_specific_bool) = narrow_class_by_return_literal("__bool__") {
+                maybe_specific_bool
+            } else if let Some(nt) = class.maybe_named_tuple_base(i_s.db) {
+                check_literal(&Literal::new(LiteralKind::Int(nt.params().len().into())))
+            } else if let Some(maybe_specific_len) = narrow_class_by_return_literal("__len__") {
+                maybe_specific_len
+            } else if t.is_final(i_s.db) {
+                Some((t.clone(), Type::Never(NeverCause::Other)))
+            } else {
+                None
+            }
         };
 
-        let check_enum = |enum_| {
-            // By default bool(<Some Enum Member>) is True, but __bool__/__len__ can change that.
-            let check_dunder = |name| {
-                let l = lookup_on_enum_instance(i_s, &|_| false, enum_, name);
-                narrow_by_return_literal(l)
-            };
-            check_dunder("__bool__")
-                .or_else(|| check_dunder("__len__"))
-                .unwrap_or_else(|| Some((t.clone(), Type::Never(NeverCause::Other))))
-        };
         match t {
             Type::None => Some((Type::Never(NeverCause::Other), Type::None)),
             Type::Literal(literal) => check_literal(literal),
@@ -1617,12 +1610,6 @@ fn split_truthy_and_falsey_t(i_s: &InferenceState, t: &Type) -> Option<(Type, Ty
             },
             Type::Class(c) => maybe_split_bool_from_literal(i_s.db, t, &LiteralKind::Bool(true))
                 .or_else(|| {
-                    let class = c.class(i_s.db);
-                    let narrow_class_by_return_literal = |name| {
-                        let l = class.lookup(i_s, name, ClassLookupOptions::new(&|_| false));
-                        narrow_by_return_literal(l)
-                    };
-
                     if c.link == i_s.db.python_state.int_link() {
                         Some((
                             t.clone(),
@@ -1638,24 +1625,13 @@ fn split_truthy_and_falsey_t(i_s: &InferenceState, t: &Type) -> Option<(Type, Ty
                             t.clone(),
                             Type::Literal(Literal::new(LiteralKind::Bytes(DbBytes::Static(b"")))),
                         ))
-                    } else if let Some(maybe_specific_bool) =
-                        narrow_class_by_return_literal("__bool__")
-                    {
-                        maybe_specific_bool
-                    } else if let Some(nt) = class.maybe_named_tuple_base(i_s.db) {
-                        check_literal(&Literal::new(LiteralKind::Int(nt.params().len().into())))
-                    } else if let Some(maybe_specific_len) =
-                        narrow_class_by_return_literal("__len__")
-                    {
-                        maybe_specific_len
-                    } else if class.use_cached_class_infos(i_s.db).is_final {
-                        Some((t.clone(), Type::Never(NeverCause::Other)))
                     } else {
-                        None
+                        check_class(c.class(i_s.db))
                     }
                 }),
-            Type::EnumMember(member) => check_enum(&member.enum_),
-            Type::Enum(enum_) => check_enum(enum_),
+            Type::Dataclass(c) => check_class(c.class(i_s.db)),
+            Type::EnumMember(member) => check_class(member.enum_.class(i_s.db)),
+            Type::Enum(enum_) => check_class(enum_.class(i_s.db)),
             Type::TypedDict(td) if td.has_required_members(i_s.db) => {
                 Some((t.clone(), Type::NEVER))
             }
@@ -1939,6 +1915,10 @@ impl<'file> Inference<'_, 'file, '_> {
         )
     }
 
+    pub fn save_narrowed_initial_name_definition(&self, link: PointLink, type_: Type) {
+        self.save_narrowed(FlowKey::Name(link), type_, false)
+    }
+
     fn save_narrowed(&self, key: FlowKey, type_: Type, widens: bool) {
         FLOW_ANALYSIS.with(|fa| {
             fa.overwrite_entry(
@@ -1987,11 +1967,13 @@ impl<'file> Inference<'_, 'file, '_> {
                     }
                     let inference = self.file.inference(i_s);
                     inference.ensure_cached_annotation(annotation, right_side.is_some());
-                    if !matches!(
-                        self.file.points.get(annotation.index()).specific(),
-                        Specific::AnnotationOrTypeCommentClassVar
-                            | Specific::AnnotationOrTypeCommentFinal
-                    ) {
+                    if self
+                        .file
+                        .points
+                        .get(annotation.index())
+                        .specific()
+                        .is_guaranteed_complete_annotation_or_type_comment()
+                    {
                         return Ok(Some(inference.use_cached_annotation(annotation)));
                     }
                 }
@@ -2010,10 +1992,8 @@ impl<'file> Inference<'_, 'file, '_> {
             if !recheck_if_on_actual_self() {
                 return Ok(None);
             }
-            let result = FLOW_ANALYSIS.with(|fa| {
-                // The class should have self generics within the functions
-                self.ensure_func_diagnostics_for_self_attribute(fa, func)
-            });
+            // The class should have self generics within the functions
+            let result = self.ensure_func_diagnostics_for_self_attribute(func);
             if result.is_err() {
                 // It is possible that the self variable is defined in a super class and we are
                 // accessing it before definition in the current class, so use the one from the
@@ -2043,11 +2023,7 @@ impl<'file> Inference<'_, 'file, '_> {
         ))
     }
 
-    fn ensure_func_diagnostics_for_self_attribute(
-        &self,
-        fa: &FlowAnalysis,
-        function: Function,
-    ) -> Result<(), ()> {
+    fn ensure_func_diagnostics_for_self_attribute(&self, function: Function) -> Result<(), ()> {
         let mut function = function; // lifetime issues?!
         if let Some(class) = function.class.as_mut() {
             let result = class.ensure_calculated_diagnostics_for_class(self.i_s.db);
@@ -2061,7 +2037,9 @@ impl<'file> Inference<'_, 'file, '_> {
             result?
         }
 
-        fa.with_new_empty_and_delay_further(self.i_s.db, || self.ensure_func_diagnostics(function))
+        FLOW_ANALYSIS.with_new_empty_and_delay_further(self.i_s.db, || {
+            function.ensure_body_diagnostics(self.i_s.db)
+        })
     }
 
     pub fn flow_analysis_for_ternary(
@@ -2252,28 +2230,30 @@ impl<'file> Inference<'_, 'file, '_> {
         let Some(if_block) = if_blocks.next() else {
             return;
         };
-        let name_binder_check = self
-            .point(if_block.first_leaf_index())
-            .maybe_calculated_and_specific();
-        if name_binder_check == Some(Specific::IfBranchAfterAlwaysReachableInNameBinder) {
-            return self.process_ifs(if_blocks, class, func);
-        }
 
         match if_block {
             IfBlockType::If(if_expr, block) => {
                 let (_, true_frame, false_frame) = self.find_guards_in_named_expr(if_expr);
-                match name_binder_check {
+                match self
+                    .point(if_block.first_leaf_index())
+                    .maybe_calculated_and_specific()
+                {
                     Some(Specific::IfBranchAlwaysReachableInTypeCheckingBlock) => {
                         FLOW_ANALYSIS.with(|fa| {
                             fa.with_in_type_checking_only_block(|| {
                                 self.calc_block_diagnostics(block, class, func);
                             })
                         });
-                        self.process_ifs(if_blocks, class, func)
                     }
                     Some(Specific::IfBranchAlwaysReachableInNameBinder) => {
                         self.calc_block_diagnostics(block, class, func);
-                        self.process_ifs(if_blocks, class, func)
+                        FLOW_ANALYSIS.with(|fa| {
+                            if let Some(mut tos) = fa.maybe_tos_frame() {
+                                // Since the other branches might be reachable on other operating
+                                // systems/Python versions we just say
+                                tos.reported_unreachable = true;
+                            }
+                        });
                     }
                     Some(Specific::IfBranchAlwaysUnreachableInNameBinder) => {
                         self.process_ifs(if_blocks, class, func)
@@ -2803,7 +2783,7 @@ impl<'file> Inference<'_, 'file, '_> {
         let (case_pattern, guard, block) = case_block.unpack();
         FLOW_ANALYSIS.with(|fa| {
             fa.in_pattern_matching.set(fa.in_pattern_matching.get() + 1);
-            let (mut truthy_frame, mut frames) = fa
+            let (mut truthy_frame, mut pattern_result) = fa
                 .with_frame_and_result(Frame::new_conditional(), || {
                     self.find_guards_in_case_pattern(subject.clone(), subject_key, case_pattern)
                 });
@@ -2811,7 +2791,7 @@ impl<'file> Inference<'_, 'file, '_> {
             // calculated in normal ways
             fa.in_pattern_matching.set(fa.in_pattern_matching.get() - 1);
 
-            let falsey_t = frames.falsey_t.as_cow_type(self.i_s);
+            let falsey_t = pattern_result.falsey_t.as_cow_type(self.i_s);
             let mut falsey_frame = if let Some(SubjectKey::Expr { key, .. }) = subject_key {
                 Frame::from_type(key.clone(), falsey_t.into_owned())
             } else {
@@ -2820,7 +2800,7 @@ impl<'file> Inference<'_, 'file, '_> {
             self.narrow_subject(
                 subject_key,
                 &mut truthy_frame,
-                frames.truthy_t.as_cow_type(self.i_s),
+                pattern_result.truthy_t.as_cow_type(self.i_s),
             );
 
             if let Some(guard) = guard {
@@ -2839,7 +2819,7 @@ impl<'file> Inference<'_, 'file, '_> {
                     if let Some(found) = guard_falsey.lookup_entry(self.i_s.db, &key)
                         && let EntryKind::Type(t) = &found.type_
                     {
-                        frames.falsey_t = Inferred::from_type(t.clone());
+                        pattern_result.falsey_t = Inferred::from_type(t.clone());
                         input_for_next_case_should_be_rewritten = false;
                     }
                     if let Some(found) = guard_truthy.lookup_entry(self.i_s.db, &key)
@@ -2854,12 +2834,12 @@ impl<'file> Inference<'_, 'file, '_> {
 
                 falsey_frame = fa.merge_or(self.i_s, falsey_frame, guard_falsey, false);
                 if !falsey_frame.unreachable && input_for_next_case_should_be_rewritten {
-                    frames.falsey_t = subject;
+                    pattern_result.falsey_t = subject;
                 }
                 self.narrow_subject(
                     subject_key,
                     &mut falsey_frame,
-                    frames.falsey_t.as_cow_type(self.i_s),
+                    pattern_result.falsey_t.as_cow_type(self.i_s),
                 );
             }
             let true_frame = fa.with_frame(truthy_frame, || {
@@ -2867,7 +2847,7 @@ impl<'file> Inference<'_, 'file, '_> {
             });
             let (false_frame, result) = fa.with_frame_and_result(falsey_frame, || {
                 self.process_match_cases_and_return_rest(
-                    frames.falsey_t,
+                    pattern_result.falsey_t,
                     subject_key,
                     case_blocks,
                     class,
@@ -3140,12 +3120,18 @@ impl<'file> Inference<'_, 'file, '_> {
             pattern.as_code(),
             inf.format_short(self.i_s)
         );
-        let _indent = debug_indent();
+        let indent = debug_indent();
         let (pattern_kind, as_name) = pattern.unpack();
         let result = self.find_guards_in_pattern_kind(inf, subject_key, pattern_kind.clone());
         if let Some(as_name) = as_name {
             self.assign_to_pattern_name(as_name, &result.truthy_t)
         }
+        drop(indent);
+        debug!(
+            "Pattern result truthy: {} falsey: {}",
+            result.truthy_t.format_short(self.i_s),
+            result.falsey_t.format_short(self.i_s)
+        );
         result
     }
 
@@ -3423,11 +3409,16 @@ impl<'file> Inference<'_, 'file, '_> {
             )
         };
         let mut added_no_match_args_issue = false;
-        //for e in truthy.into_iter_with_unpacked_unions(i_s.db, true) {
-        let mut inner_mismatch = false;
+        let inner_mismatch = Cell::new(false);
         let match_args = OnceCell::new();
         let mut nth_positional = 0;
-        let mut find_inner_guards_and_return_unreachable = |node_ref: NodeRef, name: &str, pat| {
+        let falsey_unreachable = Cell::new(true);
+        let find_inner_guards = |inf, subject_key, pat| {
+            let inner_result = self.find_guards_in_pattern(inf, subject_key, pat);
+            inner_mismatch.update(|i| i || inner_result.truthy_t.as_cow_type(i_s).is_never());
+            falsey_unreachable.update(|f| f && inner_result.is_falsey_unreachable(i_s));
+        };
+        let infer_inner_guards_and_return_unreachable = |node_ref: NodeRef, name: &str, pat| {
             let lookup = lookup(truthy, name);
             let inf = lookup.into_maybe_inferred().unwrap_or_else(|| {
                 node_ref.add_issue(
@@ -3439,9 +3430,8 @@ impl<'file> Inference<'_, 'file, '_> {
                 );
                 Inferred::new_any_from_error()
             });
-            let inner_result = self.find_guards_in_pattern(inf, None, pat);
-            inner_mismatch |= inner_result.truthy_t.as_cow_type(i_s).is_never();
-            inner_mismatch
+            find_inner_guards(inf, None, pat);
+            inner_mismatch.get()
         };
         let mut used_keywords: Vec<(&str, bool)> = vec![];
         for param in params.clone() {
@@ -3463,7 +3453,7 @@ impl<'file> Inference<'_, 'file, '_> {
                                 {
                                     let key = s.as_str(i_s.db);
                                     used_keywords.push((key, false));
-                                    if find_inner_guards_and_return_unreachable(
+                                    if infer_inner_guards_and_return_unreachable(
                                         NodeRef::new(self.file, pat.index()),
                                         key,
                                         pat,
@@ -3474,11 +3464,7 @@ impl<'file> Inference<'_, 'file, '_> {
                                     // If the type is not a literal, an error should be added
                                     // in diagnostics that __match_args__ is not correct and we
                                     // can simply work with Any here.
-                                    self.find_guards_in_pattern(
-                                        Inferred::new_any_from_error(),
-                                        None,
-                                        pat,
-                                    );
+                                    find_inner_guards(Inferred::new_any_from_error(), None, pat);
                                 }
                             } else if !added_no_match_args_issue {
                                 node_ref.add_issue(
@@ -3496,11 +3482,7 @@ impl<'file> Inference<'_, 'file, '_> {
                             return (truthy.clone(), truthy.clone());
                         }
                     } else if params.clone().count() == 1 && is_self_match_type(i_s.db, truthy) {
-                        self.find_guards_in_pattern(
-                            Inferred::from_type(truthy.clone()),
-                            subject_key,
-                            pat,
-                        );
+                        find_inner_guards(Inferred::from_type(truthy.clone()), subject_key, pat);
                     } else {
                         if !added_no_match_args_issue {
                             node_ref.add_issue(
@@ -3511,7 +3493,7 @@ impl<'file> Inference<'_, 'file, '_> {
                             );
                         }
                         added_no_match_args_issue = true;
-                        self.find_guards_in_pattern(Inferred::new_any_from_error(), None, pat);
+                        find_inner_guards(Inferred::new_any_from_error(), None, pat);
                     }
                     nth_positional += 1;
                 }
@@ -3530,7 +3512,7 @@ impl<'file> Inference<'_, 'file, '_> {
                             );
                         }
                     }
-                    if find_inner_guards_and_return_unreachable(
+                    if infer_inner_guards_and_return_unreachable(
                         NodeRef::new(self.file, keyword_pattern.index()),
                         key,
                         pat,
@@ -3541,10 +3523,17 @@ impl<'file> Inference<'_, 'file, '_> {
                 }
             }
         }
-        if inner_mismatch {
+        if inner_mismatch.get() {
             (Type::NEVER, truthy.clone())
         } else {
-            (truthy.clone(), Type::NEVER)
+            (
+                truthy.clone(),
+                if falsey_unreachable.get() {
+                    Type::NEVER
+                } else {
+                    truthy.clone()
+                },
+            )
         }
     }
 
@@ -3873,7 +3862,7 @@ impl<'file> Inference<'_, 'file, '_> {
                 .into_tuple(i_s.db, || unreachable!())
                 .into_type(i_s),
             if falsey_unreachable && (matches!(&tup.args, TupleArgs::FixedLen(_)) || had_star) {
-                Type::Never(NeverCause::Other)
+                Type::NEVER
             } else {
                 Type::Tuple(tup)
             },
@@ -3924,7 +3913,7 @@ impl<'file> Inference<'_, 'file, '_> {
                         split_truthy_and_falsey(self.i_s, &inf)
                     {
                         debug!(
-                            "Narrowed {} to true: {} and false: {}",
+                            "Walrus: Narrowed {} to true: {} and false: {}",
                             named_expr.as_code(),
                             walrus_truthy.format_short(self.i_s.db),
                             walrus_falsey.format_short(self.i_s.db)
@@ -4114,6 +4103,8 @@ impl<'file> Inference<'_, 'file, '_> {
                     let first = self.infer_primary_or_atom(primary.first());
                     match first.maybe_saved_specific(self.i_s.db) {
                         Some(Specific::BuiltinsIsinstance) => {
+                            debug!("Calculate isinstance for {}", primary.as_code());
+                            let _indent = debug_indent();
                             if let Some(frames) =
                                 self.find_isinstance_or_issubclass_frames(args, false)
                             {
@@ -4121,6 +4112,8 @@ impl<'file> Inference<'_, 'file, '_> {
                             }
                         }
                         Some(Specific::BuiltinsIssubclass) => {
+                            debug!("Calculate issubclass for {}", primary.as_code());
+                            let _indent = debug_indent();
                             if let Some(frames) =
                                 self.find_isinstance_or_issubclass_frames(args, true)
                             {
@@ -4321,11 +4314,18 @@ impl<'file> Inference<'_, 'file, '_> {
             &isinstance_type,
             |issue| self.flags().warn_unreachable && self.add_issue(args.index(), issue),
         );
-        let key = input.key?;
-        Some(FramesWithParentUnions {
-            truthy: Frame::from_type(key.clone(), truthy),
-            falsey: Frame::from_type(key, falsey),
-            parent_unions: input.parent_unions,
+        Some(if let Some(key) = input.key {
+            FramesWithParentUnions {
+                truthy: Frame::from_type(key.clone(), truthy),
+                falsey: Frame::from_type(key, falsey),
+                parent_unions: input.parent_unions,
+            }
+        } else {
+            FramesWithParentUnions {
+                truthy: Frame::from_type_without_entry(&truthy),
+                falsey: Frame::from_type_without_entry(&falsey),
+                parent_unions: input.parent_unions,
+            }
         })
     }
 
@@ -4439,6 +4439,11 @@ impl<'file> Inference<'_, 'file, '_> {
         args: Arguments,
         might_have_guard: CallableLike,
     ) -> Option<FramesWithParentUnions> {
+        debug!(
+            "Check TypeGuard/TypeIs for {}",
+            might_have_guard.format(&FormatData::new_short(self.i_s.db))
+        );
+        let _indent = debug_indent();
         match &might_have_guard {
             CallableLike::Callable(c) => self.check_type_guard_callable(simple_args, args, c, None),
             CallableLike::Overload(o) => {
@@ -4461,7 +4466,6 @@ impl<'file> Inference<'_, 'file, '_> {
                     false,
                     None,
                     false,
-                    &mut ResultContext::ValueExpected,
                     None,
                     OnTypeError::new(&on_argument_type_error),
                     &|c, calculated_type_args| {
@@ -4898,6 +4902,27 @@ impl<'file> Inference<'_, 'file, '_> {
     }
 
     fn maybe_has_primary_entry(&self, primary: Primary) -> Option<(FlowKey, Inferred)> {
+        if let PrimaryContent::GetItem(getitem) = primary.second() {
+            if !matches!(getitem, parsa_python_cst::SliceType::NamedExpression(_)) {
+                return None;
+            }
+            // Here we skip some cases that are typically type applications and should not be
+            // inferred.
+            let base = self.infer_primary_or_atom(primary.first());
+            if let Some(ComplexPoint::Class(_) | ComplexPoint::TypeAlias(_)) =
+                base.maybe_complex_point(self.i_s.db)
+            {
+                // Classes can be part of typing and would therefore cause problems with things
+                // like Sequence[] and other classes probably don't narrow.
+                return None;
+            }
+            if let Some(specific) = base.maybe_specific(self.i_s.db)
+                && specific.might_be_used_in_alias()
+            {
+                return None;
+            }
+            SliceType::new(self.file, primary.index(), getitem).infer(self.i_s);
+        }
         FLOW_ANALYSIS.with(|fa| {
             for frame in fa.frames.borrow().iter().rev() {
                 for entry in &frame.entries {
@@ -5340,6 +5365,7 @@ struct ComparisonPartInfos {
     parent_unions: RefCell<ParentUnions>,
 }
 
+#[derive(Debug)]
 struct FramesWithParentUnions {
     truthy: Frame,
     falsey: Frame,
@@ -5478,19 +5504,22 @@ fn check_for_comparison_guard(
                     return None;
                 }
                 let mut truthy = (**base_truthy).clone();
-                let is_final = match &truthy {
-                    Type::Class(c) => {
-                        if c.class(i_s.db).is_metaclass(i_s.db) {
-                            // For now ignore this, Mypy has only very few tests about this.
-                            return None;
-                        }
-                        c.class(i_s.db).use_cached_class_infos(i_s.db).is_final
-                    }
-                    _ => false,
-                };
+                if truthy.is_metaclass(i_s.db) {
+                    // For now ignore this, Mypy has only very few tests about this.
+                    return None;
+                }
+                let is_final = truthy.is_final(i_s.db);
                 let inf_t = inf.as_cow_type(i_s);
                 if !truthy.is_simple_sub_type_of(i_s, &inf_t).bool() {
                     truthy = Type::Never(NeverCause::Other);
+                }
+                if inf_t
+                    .iter_with_unpacked_unions(i_s.db)
+                    .any(|t| matches!(t, Type::EnumMember(_)))
+                {
+                    // TODO enum members should be narrowed, but otherwise have weird behavior if
+                    // we don't special case them.
+                    return None;
                 }
                 Some(FramesWithParentUnions {
                     truthy: Frame::from_type(key.clone(), truthy),
@@ -5743,11 +5772,11 @@ fn split_and_intersect(
     mut add_issue: impl Fn(IssueKind) -> bool,
 ) -> (Type, Type) {
     // Please listen to "Red Hot Chili Peppers - Otherside" here.
-    let mut true_type = Type::Never(NeverCause::Other);
+    let mut true_types = vec![];
     let mut other_side = Type::Never(NeverCause::Other);
     let matcher = &mut Matcher::with_ignored_promotions();
     let mut type_var_split = false;
-    for t in original_t.iter_with_unpacked_unions(i_s.db) {
+    for e in original_t.iter_with_unpacked_union_entries(i_s.db, true) {
         let mut split = |t: &Type| {
             let mut matched = false;
             let mut matched_with_any = true;
@@ -5778,21 +5807,21 @@ fn split_and_intersect(
                     }
                     Match::False { .. } => {
                         if isinstance_t.is_sub_type_of(i_s, matcher, t).bool() {
-                            true_type.simplified_union_in_place(i_s, isinstance_t);
+                            true_types.push((e.format_index, isinstance_t.clone()));
                         }
                     }
                 }
             }
             if matched {
                 if matched_with_any {
-                    true_type.simplified_union_in_place(i_s, isinstance_type);
+                    true_types.push((e.format_index, isinstance_type.clone()));
                     other_side.union_in_place(t.clone());
                 } else {
                     // This used to just use union_in_place. However this caused problems with bool
                     // | int, which could not be added to complex. I'm still not sure what's
                     // correct here. This feels like a very weird consequence of type promotions.
                     // This caused issues when type checking Mypy.
-                    true_type.simplified_union_in_place(i_s, t);
+                    true_types.push((e.format_index, t.clone()));
                 }
             } else {
                 other_side.union_in_place(t.clone())
@@ -5802,12 +5831,13 @@ fn split_and_intersect(
                 // Any ordering.
                 if matches!(isinstance_type, Type::Union(u) if u.entries.first().unwrap().format_index > 0)
                 {
-                    true_type = any.union(true_type.clone());
+                    true_types.push((0, any));
                 } else {
-                    true_type.union_in_place(any);
+                    true_types.push((e.format_index, any));
                 }
             }
         };
+        let t = e.type_;
         match t {
             Type::Type(inner) => match inner.as_ref() {
                 Type::Union(union) => {
@@ -5818,13 +5848,13 @@ fn split_and_intersect(
                 _ => split(t),
             },
             Type::Any(_) => {
-                true_type = isinstance_type.clone();
+                true_types.push((e.format_index, isinstance_type.clone()));
                 other_side.union_in_place(t.clone())
             }
             Type::TypeVar(tv) if matches!(tv.type_var.kind(i_s.db), TypeVarKind::Unrestricted) => {
                 if let Some(new) = intersect(i_s, t, isinstance_type, &mut add_issue) {
                     type_var_split = true;
-                    true_type = new.into_owned();
+                    true_types.push((e.format_index, new.into_owned()));
                     other_side.union_in_place(t.clone())
                 } else {
                     split(t)
@@ -5833,6 +5863,18 @@ fn split_and_intersect(
             _ => split(t),
         }
     }
+    let highest_union_format_index = true_types
+        .iter()
+        .map(|(format_index, _)| *format_index)
+        .max()
+        .unwrap_or(0);
+    let mut true_type = simplified_union_from_iterators_with_format_index(
+        i_s,
+        true_types
+            .iter()
+            .map(|(format_index, t)| (*format_index, t)),
+        highest_union_format_index,
+    );
     if true_type.is_never() {
         if original_t.overlaps(i_s, matcher, isinstance_type) {
             true_type = isinstance_type.clone();
@@ -5840,6 +5882,25 @@ fn split_and_intersect(
             for t in original_t.iter_with_unpacked_unions(i_s.db) {
                 if let Some(new) = intersect(i_s, t, isinstance_type, &mut add_issue) {
                     true_type.simplified_union_in_place(i_s, &new);
+                } else {
+                    // Avoid follow up errors for protocols that are runtime_checkable. Protocols
+                    // cannot be matched properly at runtime and therefore we should not assume
+                    // that a branch is unreachable even the type system theoretically does.
+                    let mut is_protocol = |check_t: &Type| {
+                        for isinstance_t in check_t.iter_with_unpacked_unions(i_s.db) {
+                            if let Some(class) = isinstance_t.maybe_class(i_s.db) {
+                                let class_infos = class.use_cached_class_infos(i_s.db);
+                                if matches!(class_infos.kind, ClassKind::Protocol) {
+                                    true_type.simplified_union_in_place(i_s, t);
+                                }
+                            }
+                        }
+                    };
+                    if let Type::Type(check) = isinstance_type {
+                        is_protocol(check)
+                    } else {
+                        is_protocol(isinstance_type)
+                    }
                 }
             }
         }
@@ -5964,7 +6025,13 @@ fn intersect<'x>(
     t2: &'x Type,
     add_issue: &mut dyn FnMut(IssueKind) -> bool,
 ) -> Option<Cow<'x, Type>> {
-    Some(if t2.is_simple_sub_type_of(i_s, t1).bool() {
+    // This is kind of isinstance logic and basic TypeVars should be intersected
+    let erased_t1 = if matches!(t1, Type::TypeVar(_)) {
+        Cow::Borrowed(t1)
+    } else {
+        t1.erase_type_var_likes(i_s.db, &|| None)
+    };
+    Some(if t2.is_simple_sub_type_of(i_s, &erased_t1).bool() {
         Cow::Borrowed(t2)
     } else if t2.is_simple_super_type_of(i_s, t1).bool() {
         Cow::Borrowed(t1)

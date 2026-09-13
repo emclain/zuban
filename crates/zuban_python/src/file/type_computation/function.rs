@@ -7,7 +7,10 @@ use parsa_python_cst::{
 use utils::FastHashSet;
 
 use crate::{
-    database::{ComplexPoint, Database, Locality, ParentScope, Point, PointLink, Specific},
+    database::{
+        ComplexPoint, Database, Locality, OverloadDefinition, ParentScope, Point, PointLink,
+        Specific,
+    },
     diagnostics::{Issue, IssueKind},
     file::{FUNC_TO_RETURN_OR_YIELD_DIFF, FUNC_TO_TYPE_VAR_DIFF, PythonFile, func_parent_scope},
     inference_state::InferenceState,
@@ -223,8 +226,7 @@ impl<'db: 'file, 'file> FuncNodeRef<'file> {
         match type_vars.is_empty() {
             true => type_var_reference
                 .set_point(Point::new_specific(Specific::Analyzed, Locality::Todo)),
-            false => type_var_reference
-                .insert_complex(ComplexPoint::TypeVarLikes(type_vars), Locality::Todo),
+            false => type_var_reference.insert_type_var_likes(i_s.db, type_vars),
         }
         debug_assert!(type_var_reference.point().calculated());
         Some((type_guard, star_annotation))
@@ -371,7 +373,7 @@ impl<'db: 'file, 'file> FuncNodeRef<'file> {
                     .has_self_type(i_s.db)
             {
                 self.expect_return_annotation_node_ref()
-                    .add_type_issue(i_s.db, IssueKind::SelfArgumentMissing);
+                    .add_type_issue(i_s.db, IssueKind::SelfParameterMissing);
             }
             result
         });
@@ -384,11 +386,6 @@ impl<'db: 'file, 'file> FuncNodeRef<'file> {
         // This is part of the conformance tests and behaves there like normal late bound callables
         // do.
         let type_vars = type_computation.into_type_vars(|inf, recalculate_type_vars| {
-            for param in func_node.params().iter() {
-                if let Some(annotation) = param.annotation() {
-                    inf.recalculate_annotation_type_vars(annotation.index(), recalculate_type_vars);
-                }
-            }
             if let Some(return_annot) = func_node.return_annotation() {
                 inf.recalculate_annotation_type_vars(return_annot.index(), recalculate_type_vars);
             }
@@ -423,6 +420,14 @@ impl<'db: 'file, 'file> FuncNodeRef<'file> {
         (type_vars, type_guard, star_annotation)
     }
 
+    pub fn maybe_overload(&self) -> Option<&'file OverloadDefinition> {
+        if let ComplexPoint::FunctionOverload(overload) = self.maybe_complex()? {
+            Some(overload)
+        } else {
+            None
+        }
+    }
+
     pub fn return_annotation_type(&self, i_s: &InferenceState<'db, '_>) -> Cow<'file, Type> {
         self.return_annotation()
             .map(|a| {
@@ -437,13 +442,21 @@ impl<'db: 'file, 'file> FuncNodeRef<'file> {
         let t = self.return_annotation_type(i_s);
         if self.is_async() && !self.is_generator() {
             Cow::Owned(new_class!(
-                i_s.db.python_state.coroutine_link(),
-                Type::Any(AnyCause::Todo),
-                Type::Any(AnyCause::Todo),
+                Self::coroutine_link_depending_on_mypy_compatibility(i_s.db),
+                Type::Any(AnyCause::AsyncCoroutine),
+                Type::Any(AnyCause::AsyncCoroutine),
                 t.into_owned(),
             ))
         } else {
             t
+        }
+    }
+
+    pub fn coroutine_link_depending_on_mypy_compatibility(db: &Database) -> PointLink {
+        if db.mypy_compatible() {
+            db.python_state.coroutine_link()
+        } else {
+            db.python_state.coroutine_type_link()
         }
     }
 }

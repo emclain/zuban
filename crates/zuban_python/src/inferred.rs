@@ -30,15 +30,16 @@ use crate::{
     type_::{
         AnyCause, CallableContent, CallableLike, CallableParams, ClassGenerics, DbBytes, DbString,
         FunctionKind, FunctionOverload, GenericClass, GenericItem, GenericsList, IterCause,
-        IterInfos, Literal as DbLiteral, LiteralKind, LiteralValue, LookupResult, NeverCause,
-        PropertySetter, PropertySetterType, ReplaceTypeVarLikes, Type, TypeVarKind, TypeVarLike,
-        TypeVarLikes, execute_tuple_class, execute_type_of_type,
+        IterInfos, Literal as DbLiteral, LiteralKind, LiteralValue, LookupArgs, LookupResult,
+        NeverCause, PropertySetter, PropertySetterType, ReplaceTypeVarLikes, Type, TypeVarKind,
+        TypeVarLike, TypeVarLikes, execute_tuple_class, execute_type_of_type,
     },
     type_helpers::{
         BoundMethod, BoundMethodFunction, Callable, Class, FirstParamProperties, FuncLike as _,
         Function, Instance, LookupDetails, OverloadedFunction, TypeOrClass, execute_assert_type,
         execute_cast, execute_isinstance, execute_issubclass, execute_reveal_type, execute_super,
     },
+    utils::debug_indent,
 };
 
 pub const NAME_DEF_TO_DEFAULTDICT_DIFF: i64 = -1;
@@ -148,7 +149,7 @@ impl<'db: 'slf, 'slf> Inferred {
         Self::from_type(new_class!(db.python_state.list_node_ref().as_link(), inner,))
     }
 
-    pub fn new_any_from_error() -> Self {
+    pub const fn new_any_from_error() -> Self {
         Self::from_type(Type::ERROR)
     }
 
@@ -171,7 +172,7 @@ impl<'db: 'slf, 'slf> Inferred {
         }
     }
 
-    pub fn from_type(t: Type) -> Self {
+    pub const fn from_type(t: Type) -> Self {
         Self {
             state: InferredState::UnsavedComplex(ComplexPoint::TypeInstance(t)),
         }
@@ -681,8 +682,10 @@ impl<'db: 'slf, 'slf> Inferred {
                     if std::cfg!(debug_assertions) {
                         let node_ref = NodeRef::new(file, index);
                         panic!(
-                            "Why overwrite? New: {:?} Previous: {node_ref:?} line {}",
+                            "Why overwrite? New: {:?} Previous: {:?} on {}:{}",
                             self.debug_info(i_s.db),
+                            node_ref.debug_info(i_s.db),
+                            file.file_path_with_scheme(i_s.db).as_uri(),
                             node_ref.line_one_based(i_s.db)
                         );
                     }
@@ -780,15 +783,12 @@ impl<'db: 'slf, 'slf> Inferred {
     }
 
     pub fn avoid_implicit_literal(self, i_s: &InferenceState) -> Self {
-        match self.avoid_implicit_literal_cow(i_s) {
-            Cow::Borrowed(_) => self,
-            Cow::Owned(owned) => owned,
-        }
+        self.maybe_avoid_implicit_literal(i_s).unwrap_or(self)
     }
 
-    pub fn avoid_implicit_literal_cow(&self, i_s: &InferenceState) -> Cow<'_, Self> {
+    pub fn maybe_avoid_implicit_literal(&self, i_s: &InferenceState) -> Option<Self> {
         if i_s.is_calculating_enum_members() {
-            return Cow::Borrowed(self);
+            return None;
         }
         match self.state {
             InferredState::Saved(link) => {
@@ -797,30 +797,30 @@ impl<'db: 'slf, 'slf> Inferred {
                 match point.kind() {
                     PointKind::Specific => match point.specific() {
                         Specific::MaybeSelfParam => {
-                            return Cow::Owned(Inferred::from_type(i_s.current_type().unwrap()));
+                            return Some(Inferred::from_type(i_s.current_type().unwrap()));
                         }
                         Specific::IntLiteral
                         | Specific::StringLiteral
                         | Specific::BytesLiteral
                         | Specific::BoolLiteral
                         | Specific::AnnotationOrTypeCommentFinal => (),
-                        _ => return Cow::Borrowed(self),
+                        _ => return None,
                     },
                     PointKind::Complex => {
                         if node_ref.maybe_complex().unwrap().maybe_instance().is_none() {
-                            return Cow::Borrowed(self);
+                            return None;
                         }
                     }
-                    _ => return Cow::Borrowed(self),
+                    _ => return None,
                 }
             }
             InferredState::UnsavedComplex(ComplexPoint::TypeInstance(_)) => (),
-            _ => return Cow::Borrowed(self),
+            _ => return None,
         }
         if let Some(t) = self.as_cow_type(i_s).maybe_avoid_implicit_literal(i_s.db) {
-            Cow::Owned(Self::from_type(t))
+            Some(Self::from_type(t))
         } else {
-            Cow::Borrowed(self)
+            None
         }
     }
 
@@ -881,6 +881,8 @@ impl<'db: 'slf, 'slf> Inferred {
         disallow_lazy_bound_method: bool,
         avoid_inferring_return_types: bool,
     ) -> Option<(Self, AttributeKind)> {
+        let disallow_lazy_bound_method =
+            disallow_lazy_bound_method || matches!(instance, Type::Intersection(_));
         self.bind_instance_descriptors_internal(
             i_s,
             for_name,
@@ -1080,6 +1082,7 @@ impl<'db: 'slf, 'slf> Inferred {
                                                     {
                                                         create_signature_without_self_for_callable(
                                                             i_s,
+                                                            for_name,
                                                             callable,
                                                             &instance,
                                                             &attribute_class,
@@ -1280,6 +1283,7 @@ impl<'db: 'slf, 'slf> Inferred {
                         if let Some(f) = c.first_positional_type() {
                             let mut new_c = create_signature_without_self_for_callable(
                                 i_s,
+                                for_name,
                                 c,
                                 &instance,
                                 &attribute_class,
@@ -1541,7 +1545,7 @@ impl<'db: 'slf, 'slf> Inferred {
                                                 .collect(),
                                         ),
                                     )),
-                                    AttributeKind::Attribute,
+                                    AttributeKind::DefMethod { is_final: false },
                                 ));
                             }
                             FunctionKind::Property { .. } => unreachable!(),
@@ -1801,6 +1805,8 @@ impl<'db: 'slf, 'slf> Inferred {
         class_of_attribute: Option<Class>,
         add_issue: &dyn Fn(IssueKind) -> bool,
     ) -> Self {
+        debug!("Bind __new__ descriptors");
+        let indent = debug_indent();
         // This method exists for __new__
         let attribute_class = class_of_attribute.unwrap_or(*class);
         let to_class_method = |callable| {
@@ -1847,6 +1853,10 @@ impl<'db: 'slf, 'slf> Inferred {
                             let Some(inf) =
                                 infer_overloaded_class_method(i_s, *class, attribute_class, o)
                             else {
+                                drop(indent);
+                                debug!(
+                                    "Issue: Class method for __new__ cannot be created, using any instead"
+                                );
                                 return Self::new_any_from_error();
                             };
                             return inf;
@@ -1923,6 +1933,14 @@ impl<'db: 'slf, 'slf> Inferred {
                         widened.widened.format_short(db)
                     )
                 }
+                ComplexPoint::PyTypedMissing(_) => "PyTypedMissing(...)".into(),
+                ComplexPoint::HeuristicBound(heuristic) => {
+                    format!(
+                        "HeuristicBound(type={}, bound={})",
+                        heuristic.type_.format_short(db),
+                        heuristic.bound_to.format_short(db),
+                    )
+                }
             }
         }
         match &self.state {
@@ -1976,7 +1994,7 @@ impl<'db: 'slf, 'slf> Inferred {
             Specific::AnyDueToError
             | Specific::Cycle
             | Specific::InvalidTypeDefinition
-            | Specific::PyTypedMissing => Some(AnyCause::FromError),
+            | Specific::BinaryExtension => Some(AnyCause::FromError),
             Specific::AnnotationOrTypeCommentWithoutTypeVars => Some(AnyCause::FromError),
             Specific::ModuleNotFound => Some(AnyCause::ModuleNotFound),
             _ => None,
@@ -1994,13 +2012,11 @@ impl<'db: 'slf, 'slf> Inferred {
         callable: &mut impl FnMut(&Type, LookupDetails),
     ) {
         self.as_cow_type(i_s).run_after_lookup_on_each_union_member(
-            i_s,
             Some(self),
-            in_file,
-            name,
-            kind,
+            LookupArgs::new(i_s, in_file, name)
+                .with_kind(kind)
+                .with_add_issue(add_issue),
             &mut ResultContext::ValueExpected,
-            add_issue,
             callable,
         )
     }
@@ -2142,9 +2158,7 @@ impl<'db: 'slf, 'slf> Inferred {
                                 } = &result_context
                                 {
                                     debug!("Execute type definition with {}", stringify!($name));
-                                    let n = NodeRef::from_link(i_s.db, *assignment_definition);
-                                    return n
-                                        .file
+                                    return assignment_definition.file(i_s.db)
                                         .name_resolution_for_types(i_s)
                                         .$name($($args)?);
                                 }
@@ -2182,6 +2196,9 @@ impl<'db: 'slf, 'slf> Inferred {
                                     args.add_issue(i_s, IssueKind::UnexpectedTypeForTypeVar);
                                 }
                             }
+                            Specific::BuiltinsSentinel => {
+                                return_on_type_def!(compute_sentinel_assignment, args);
+                            }
                             Specific::TypingNewType
                                 if result_context.is_annotation_assignment() =>
                             {
@@ -2195,13 +2212,12 @@ impl<'db: 'slf, 'slf> Inferred {
                                     assignment_definition,
                                 } = &result_context
                                 {
-                                    let n = NodeRef::from_link(i_s.db, *assignment_definition);
-                                    return n
-                                        .file
+                                    return assignment_definition
+                                        .file(i_s.db)
                                         .name_resolution_for_types(i_s)
                                         .compute_special_alias_assignment(
                                             specific,
-                                            n.expect_assignment(),
+                                            assignment_definition.as_node(i_s.db),
                                         );
                                 }
                             }
@@ -2228,13 +2244,12 @@ impl<'db: 'slf, 'slf> Inferred {
                                     assignment_definition,
                                 } = &result_context
                                 {
-                                    let n = NodeRef::from_link(i_s.db, *assignment_definition);
-                                    if let Some(inf) = n
-                                        .file
+                                    if let Some(inf) = assignment_definition
+                                        .file(i_s.db)
                                         .name_resolution_for_types(i_s)
                                         .execute_type_alias_from_type_alias_type(
                                             args,
-                                            n.expect_assignment(),
+                                            assignment_definition.as_node(i_s.db),
                                         )
                                     {
                                         return inf;
@@ -2282,7 +2297,7 @@ impl<'db: 'slf, 'slf> Inferred {
                                 return Inferred::new_object(i_s.db);
                             }
                             Specific::TypingTypeForm => {
-                                debug!("Execute type definition with {}", stringify!($name));
+                                debug!("Execute type definition with TypeForm");
                                 if let Some(file) = args.in_file() {
                                     return file
                                         .name_resolution_for_types(i_s)
@@ -2340,7 +2355,7 @@ impl<'db: 'slf, 'slf> Inferred {
                                     {
                                         node_ref.add_issue(
                                             i_s,
-                                            IssueKind::MissingTypeParameters {
+                                            IssueKind::MissingTypeArguments {
                                                 name: alias.name(i_s.db).into(),
                                             },
                                         );
@@ -2416,8 +2431,6 @@ impl<'db: 'slf, 'slf> Inferred {
                     | Specific::TypingType
                     | Specific::TypingLiteral
                     | Specific::TypingAnnotated
-                    | Specific::TypingNamedTuple
-                    | Specific::CollectionsNamedTuple
                     | Specific::TypingCallable
                     | Specific::MypyExtensionsFlexibleAlias),
                 ) => {
@@ -2429,6 +2442,13 @@ impl<'db: 'slf, 'slf> Inferred {
                             *slice_type,
                             result_context,
                         );
+                }
+                Some(Specific::TypingNamedTuple) => {
+                    // The situation around NamedTuple is weird, because it's actually a function,
+                    // but in Typeshed it's a class that inherits from tuple.
+                    slice_type
+                        .as_node_ref()
+                        .add_issue(i_s, IssueKind::OnlyClassTypeApplication);
                 }
                 _ => {
                     let node_ref = NodeRef::from_link(i_s.db, link);
@@ -2672,18 +2692,23 @@ fn infer_overloaded_class_method(
     attribute_class: Class,
     o: &OverloadDefinition,
 ) -> Option<Inferred> {
-    let functions: Box<[_]> = o
+    let functions: Arc<[_]> = o
         .iter_functions()
-        .filter_map(|callable| {
-            let c = infer_class_method(i_s, class, attribute_class, callable, None)?;
+        .enumerate()
+        .filter_map(|(i, callable)| {
+            debug!("Bind class method overload member #{i}");
+            let indent = debug_indent();
+            let Some(c) = infer_class_method(i_s, class, attribute_class, callable, None) else {
+                drop(indent);
+                debug!("Class method overload member #{i} did not match, skipping it");
+                return None;
+            };
             Some(Arc::new(c))
         })
         .collect();
-    Some(Inferred::from_type(match functions.len() {
-        0 => return None,
-        1 => Type::Callable(functions.into_vec().into_iter().next().unwrap()),
-        _ => Type::FunctionOverload(FunctionOverload::new(functions)),
-    }))
+    Some(Inferred::from_type(
+        CallableLike::from_overload_funcs(functions)?.into(),
+    ))
 }
 
 pub fn infer_class_method_on_instance<'db: 'class, 'class>(
@@ -2767,14 +2792,17 @@ fn proper_classmethod_callable(
                 let c = Callable::new(original_callable, None);
                 let mut matcher = Matcher::new_callable_matcher(&c);
                 let t = replace_class_type_vars(i_s.db, t, func_class, &|| Some(as_type()));
-                if !t
-                    .is_super_type_of(i_s, &mut matcher, &as_type_type())
-                    .bool()
+                // It feels weird to do this here, but this is just annoying currently
+                if !matches!(func_class.generics, Generics::Self_ { .. })
+                    && !t
+                        .is_super_type_of(i_s, &mut matcher, &as_type_type())
+                        .bool()
                 {
                     return None;
                 }
                 if let Type::Type(t) = t.as_ref()
                     && let Type::TypeVar(usage) = t.as_ref()
+                    && usage.in_definition == callable.defined_at
                 {
                     class_method_type_var_usage = Some(usage.clone());
                     type_vars.remove(0);
@@ -2831,7 +2859,7 @@ fn proper_classmethod_callable(
                 // generic in the function of the classmethod, see for example
                 // `testGenericClassMethodUnboundOnClass`.
                 if let Some(class) = class_generics_not_defined_yet {
-                    return result.replace_type_var_likes_and_self(
+                    return result.maybe_replace_type_var_likes_and_self(
                         i_s.db,
                         &mut |usage| {
                             if usage.in_definition() == class.node_ref.as_link() {
@@ -2923,9 +2951,10 @@ fn type_of_complex<'db: 'x, 'x>(
         ComplexPoint::TypedDictDefinition(t) => Cow::Owned(Type::Type(t.type_.clone())),
         ComplexPoint::IndirectFinal(t) => Cow::Borrowed(t),
         ComplexPoint::WidenedType(widened) => type_of_complex(i_s, &widened.original, definition),
-        _ => {
-            unreachable!("Classes are handled earlier {complex:?}")
-        }
+        ComplexPoint::PyTypedMissing(_) => Cow::Borrowed(&Type::ERROR),
+        ComplexPoint::HeuristicBound(b) => Cow::Borrowed(&b.type_),
+        ComplexPoint::ClassInfos(_) => unreachable!("Classes are handled earlier {complex:?}"),
+        ComplexPoint::TypeVarLikes(_) => unreachable!("TypeVarLikes should never be accessed"),
     }
 }
 
@@ -2939,7 +2968,12 @@ fn saved_as_type<'db>(i_s: &InferenceState<'db, '_>, definition: PointLink) -> C
             type_of_complex(i_s, complex, Some(definition))
         }
         PointKind::FileReference => Cow::Owned(Type::Module(point.file_index())),
-        x => unreachable!("{x:?}"),
+        x => {
+            if cfg!(debug_assertions) {
+                unreachable!("{x:?}")
+            }
+            Cow::Borrowed(&Type::ERROR)
+        }
     }
 }
 
@@ -2949,11 +2983,13 @@ pub fn specific_to_type<'db>(
     specific: Specific,
 ) -> Cow<'db, Type> {
     match specific {
-        Specific::AnyDueToError | Specific::InvalidTypeDefinition | Specific::PyTypedMissing => {
+        Specific::AnyDueToError | Specific::InvalidTypeDefinition | Specific::BinaryExtension => {
             Cow::Borrowed(&Type::ERROR)
         }
         Specific::ModuleNotFound => Cow::Borrowed(&Type::Any(AnyCause::ModuleNotFound)),
-        Specific::Cycle => Cow::Borrowed(&Type::Any(AnyCause::Todo)),
+        Specific::Cycle | Specific::UntypedFunctionSelfAssignment => {
+            Cow::Borrowed(&Type::Any(AnyCause::Todo))
+        }
         Specific::IntLiteral => Cow::Owned(Type::Literal(DbLiteral {
             kind: LiteralKind::Int(definition.expect_int().parse()),
             implicit: true,
@@ -3105,7 +3141,13 @@ pub fn specific_to_type<'db>(
         Specific::TypingTypeAliasType => Cow::Owned(Type::Type(Arc::new(
             i_s.db.python_state.type_alias_type_type(),
         ))),
-        actual => unreachable!("{actual:?}"),
+        Specific::BuiltinsSentinel => {
+            Cow::Owned(Type::Type(Arc::new(i_s.db.python_state.sentinel_type())))
+        }
+        actual => {
+            recoverable_error!("Wanted to make invalid Specific to a type: {actual:?}");
+            Cow::Borrowed(&Type::ERROR)
+        }
     }
 }
 

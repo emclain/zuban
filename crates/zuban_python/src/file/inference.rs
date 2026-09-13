@@ -16,8 +16,11 @@ use crate::{
     debug,
     diagnostics::{Issue, IssueKind},
     file::{
-        OtherDefinitionIterator, flow_analysis::RedefinitionResult,
-        name_resolution::PointResolution, type_computation::TypeCommentState, utils::TupleGatherer,
+        OtherDefinitionIterator,
+        flow_analysis::RedefinitionResult,
+        name_resolution::{PointResolution, StarImportResult},
+        type_computation::TypeCommentState,
+        utils::TupleGatherer,
     },
     format_data::FormatData,
     getitem::SliceType,
@@ -31,16 +34,16 @@ use crate::{
         TupleLenInfos, format_got_expected,
     },
     new_class,
-    node_ref::NodeRef,
+    node_ref::{KnownNodeRef, KnownPointLink, NodeRef},
     params::matches_simple_params,
     pytest::maybe_infer_pytest_param,
     recoverable_error,
     result_context::{CouldBeALiteral, ResultContext, ResultContextOrigin},
     type_::{
         AnyCause, CallableContent, CallableParam, CallableParams, DbString, IterCause, IterInfos,
-        Literal, LiteralKind, LookupResult, ParamType, StarParamType, StarStarParamType,
-        StringSlice, Tuple, TupleArgs, TupleUnpack, Type, UnionEntry, UnionType, Variance,
-        dataclass_converter_fields_lookup,
+        Literal, LiteralKind, LiteralValue, LookupResult, ParamType, StarParamType,
+        StarStarParamType, StringSlice, Tuple, TupleArgs, TupleUnpack, Type, UnionEntry, UnionType,
+        Variance, dataclass_converter_fields_lookup,
     },
     type_helpers::{
         Class, ClassLookupOptions, FirstParamKind, Function, GeneratorType, Instance,
@@ -51,6 +54,7 @@ use crate::{
 
 const ENUM_NAMES_OVERRIDABLE: [&str; 2] = ["value", "name"];
 
+#[derive(Copy, Clone)]
 pub(crate) struct Inference<'db, 'file, 'i_s>(pub(super) NameResolution<'db, 'file, 'i_s>);
 
 impl<'db: 'file, 'file, 'i_s> std::ops::Deref for Inference<'db, 'file, 'i_s> {
@@ -268,8 +272,19 @@ impl<'db, 'file> Inference<'db, 'file, '_> {
 
     pub(super) fn set_calculating_on_target(&self, target: Target) {
         match target {
-            Target::Name(name_def) | Target::NameExpression(_, name_def) => {
+            Target::Name(name_def) => {
                 self.set_point(name_def.index(), Point::new_calculating());
+            }
+            Target::NameExpression(_, name_def) => {
+                if !matches!(
+                    self.file
+                        .points
+                        .get(name_def.index())
+                        .maybe_calculated_and_specific(),
+                    Some(Specific::UntypedFunctionSelfAssignment)
+                ) {
+                    self.set_point(name_def.index(), Point::new_calculating());
+                }
             }
             Target::IndexExpression(_) => (),
             Target::Tuple(targets) => {
@@ -302,7 +317,7 @@ impl<'db, 'file> Inference<'db, 'file, '_> {
             let ErrorStrs { expected, got } = error_types.as_boxed_strs(self.i_s.db);
             Some(IssueKind::IncompatibleAssignment { got, expected })
         };
-        expected.error_if_not_matches(
+        expected.error_if_not_assignable(
             self.i_s,
             &right,
             |issue| self.add_issue(right_side.index(), issue),
@@ -325,11 +340,16 @@ impl<'db, 'file> Inference<'db, 'file, '_> {
         self.check_right_side_against_expected(expected, right, right_side)
     }
 
-    pub fn assign_for_annotation(&self, annotation: Annotation, target: Target, node_ref: NodeRef) {
+    pub fn assign_for_annotation(
+        &self,
+        annotation: Annotation,
+        target: Target,
+        node_ref: KnownNodeRef<Assignment>,
+    ) {
         let inf_annot = self.use_cached_annotation(annotation);
         self.assign_single_target(
             target,
-            node_ref,
+            *node_ref,
             &inf_annot,
             AssignKind::Annotation {
                 specific: inf_annot.maybe_saved_specific(self.i_s.db),
@@ -355,7 +375,7 @@ impl<'db, 'file> Inference<'db, 'file, '_> {
     }
 
     pub fn ensure_cached_assignment(&self, assignment: Assignment) {
-        let node_ref = NodeRef::new(self.file, assignment.index());
+        let node_ref = KnownNodeRef::new(self.file, assignment);
         if node_ref.point().calculated() {
             return;
         }
@@ -434,7 +454,7 @@ impl<'db, 'file> Inference<'db, 'file, '_> {
                     origin: ResultContextOrigin::NormalAssignment,
                 },
                 None => ResultContext::AssignmentNewDefinition {
-                    assignment_definition: PointLink::new(self.file.file_index, assignment.index()),
+                    assignment_definition: KnownPointLink::new(self.file.file_index, assignment),
                 },
             };
             self.infer_assignment_right_side(right_side, &mut result_context)
@@ -448,7 +468,7 @@ impl<'db, 'file> Inference<'db, 'file, '_> {
     #[inline]
     fn cache_annotation_assignment(
         &self,
-        assignment_node_ref: NodeRef,
+        node_ref: KnownNodeRef<Assignment>,
         target: Target,
         annotation: Annotation,
         right_side: Option<AssignmentRightSide>,
@@ -456,20 +476,9 @@ impl<'db, 'file> Inference<'db, 'file, '_> {
         self.set_calculating_on_target(target.clone());
         self.ensure_cached_annotation(annotation, right_side.is_some());
         let specific = self.point(annotation.index()).maybe_specific();
-        let assign_kind = AssignKind::Annotation { specific };
         match specific {
             Some(Specific::AnnotationTypeAlias) => {
-                let inf =
-                    self.compute_explicit_type_assignment(assignment_node_ref.expect_assignment());
-                self.assign_single_target(
-                    target,
-                    assignment_node_ref,
-                    &inf,
-                    assign_kind,
-                    |index, inf| {
-                        inf.clone().save_redirect(self.i_s, self.file, index);
-                    },
-                );
+                self.assign_annotation_type_alias(node_ref, target);
             }
             _ => {
                 let mut checked = false;
@@ -487,7 +496,7 @@ impl<'db, 'file> Inference<'db, 'file, '_> {
                         right_side,
                     )
                 }
-                self.assign_for_annotation(annotation, target, assignment_node_ref);
+                self.assign_for_annotation(annotation, target, node_ref);
                 if let Some(right_side) = right_side
                     && !checked
                 {
@@ -498,10 +507,25 @@ impl<'db, 'file> Inference<'db, 'file, '_> {
         }
     }
 
+    fn assign_annotation_type_alias(&self, node_ref: KnownNodeRef<Assignment>, target: Target) {
+        let inf = self.compute_explicit_type_assignment(node_ref.as_node());
+        self.assign_single_target(
+            target,
+            *node_ref,
+            &inf,
+            AssignKind::Annotation {
+                specific: Some(Specific::AnnotationTypeAlias),
+            },
+            |index, inf| {
+                inf.clone().save_redirect(self.i_s, self.file, index);
+            },
+        );
+    }
+
     #[inline]
     fn cache_aug_assign(
         &self,
-        node_ref: NodeRef,
+        node_ref: KnownNodeRef<Assignment>,
         target: Target,
         aug_assign: AugAssign,
         right_side: AssignmentRightSide,
@@ -514,7 +538,7 @@ impl<'db, 'file> Inference<'db, 'file, '_> {
                 self.i_s,
                 node_ref.file,
                 inplace_method,
-                &KnownArgs::new(&right, node_ref),
+                &KnownArgs::new(&right, *node_ref),
                 &mut ResultContext::ValueExpected,
                 &|_type| had_lookup_error.set(true),
             );
@@ -586,7 +610,7 @@ impl<'db, 'file> Inference<'db, 'file, '_> {
                 // Invalid syntax
                 Target::Tuple(_) | Target::Starred(_) => unreachable!(),
             };
-            self.assign_any_to_target(target, node_ref)
+            self.assign_any_to_target(target, *node_ref)
         }
     }
 
@@ -737,7 +761,7 @@ impl<'db, 'file> Inference<'db, 'file, '_> {
                 );
                 Inferred::from_type(generator.yield_type)
                     .as_cow_type(i_s)
-                    .error_if_not_matches(
+                    .error_if_not_assignable(
                         i_s,
                         &inf,
                         |issue| from.add_issue(i_s, issue),
@@ -757,7 +781,7 @@ impl<'db, 'file> Inference<'db, 'file, '_> {
                     return Inferred::new_any_from_error();
                 }
                 let (iter_result, yields) = self.infer_yield_from_details(yield_from);
-                generator.yield_type.error_if_not_matches(
+                generator.yield_type.error_if_not_assignable(
                     i_s,
                     &yields,
                     |issue| from.add_issue(i_s, issue),
@@ -792,9 +816,6 @@ impl<'db, 'file> Inference<'db, 'file, '_> {
                     } else {
                         if result_context.expect_not_none() {
                             from.add_issue(i_s, IssueKind::DoesNotReturnAValue("Function".into()));
-                            if i_s.db.mypy_compatible() {
-                                return Inferred::new_any_from_error();
-                            }
                         }
                         Inferred::new_none()
                     }
@@ -927,7 +948,8 @@ impl<'db, 'file> Inference<'db, 'file, '_> {
                 })
                 .or_else(|| {
                     Some(
-                        self.lookup_from_star_import(name_def.as_code(), true)?
+                        self.lookup_from_star_import(name_def.as_code(), true)
+                            .ok()?
                             .as_inferred(self.i_s),
                     )
                 })
@@ -1197,7 +1219,7 @@ impl<'db, 'file> Inference<'db, 'file, '_> {
         assign_kind: AssignKind,
     ) -> bool {
         let mut had_error = false;
-        declaration_t.error_if_not_matches(
+        declaration_t.error_if_not_assignable(
             self.i_s,
             value,
             |issue| from.add_issue(self.i_s, issue),
@@ -1492,7 +1514,7 @@ impl<'db, 'file> Inference<'db, 'file, '_> {
                 // Nothing needed to assign anymore, the original definition was already assigned.
                 return;
             }
-            if let Some(lookup_in_bases) = lookup_self_attribute_in_bases {
+            let original_inf = if let Some(lookup_in_bases) = lookup_self_attribute_in_bases {
                 let lookup_details = lookup_in_bases();
                 if let Some(inf) = lookup_details.lookup.into_maybe_inferred() {
                     if lookup_details.attr_kind == AttributeKind::Final
@@ -1511,8 +1533,21 @@ impl<'db, 'file> Inference<'db, 'file, '_> {
                     }
                     return;
                 }
-            }
-            let original_inf = self.infer_name_of_definition_by_index(first_index);
+                let Some(class) = self.i_s.current_class() else {
+                    recoverable_error!("Expected there to be a class for self attr assignment");
+                    return;
+                };
+                // let func_def = func_of_self_symbol(self.file, self_symbol);
+                // TODO what about the error here?
+                match self.self_lookup_with_flow_analysis(class, first_index, &|_| false) {
+                    // This means it's not a lookup on self, but does this ever happen?
+                    Ok(None) => self.infer_name_of_definition_by_index(first_index),
+                    Ok(Some(inf)) => inf,
+                    Err(_) => return, // TODO?
+                }
+            } else {
+                self.infer_name_of_definition_by_index(first_index)
+            };
             // Walrus is special, because it relays values from the expression to the outer
             // expression.
             if self.i_s.db.run_cause == RunCause::LanguageServer
@@ -1536,7 +1571,7 @@ impl<'db, 'file> Inference<'db, 'file, '_> {
                         check_assign_including_partials,
                     );
                 }
-            } else if let Some(star_imp) = self.lookup_from_star_import_with_node_index(
+            } else if let Ok(star_imp) = self.lookup_from_star_import_with_node_index(
                 name_def.as_code(),
                 true,
                 Some(name_def.index()),
@@ -1561,14 +1596,21 @@ impl<'db, 'file> Inference<'db, 'file, '_> {
                 );
                 return;
             }
-            let value = match assign_kind {
+            let mut need_additional_narrowing = false;
+            let new_declaration_value = match assign_kind {
                 AssignKind::Normal | AssignKind::Walrus => {
-                    value.avoid_implicit_literal_cow(self.i_s)
+                    match value.maybe_avoid_implicit_literal(self.i_s) {
+                        Some(inf) => {
+                            need_additional_narrowing = true;
+                            Cow::Owned(inf)
+                        }
+                        None => Cow::Borrowed(value),
+                    }
                 }
                 _ => Cow::Borrowed(value),
             };
             if assign_kind.is_normal_assignment() {
-                if let Some(partial) = value.maybe_new_partial(i_s, |t| {
+                if let Some(partial) = new_declaration_value.maybe_new_partial(i_s, |t| {
                     set_defaultdict_type(NodeRef::new(self.file, name_def.index()), t)
                 }) {
                     let name_def_index = name_def.index();
@@ -1609,7 +1651,7 @@ impl<'db, 'file> Inference<'db, 'file, '_> {
                     }
 
                     return;
-                } else if let Some(inf) = value
+                } else if let Some(inf) = new_declaration_value
                     .maybe_any_with_unknown_type_params(i_s, NodeRef::new(self.file, current_index))
                 {
                     save(name_def.index(), &inf);
@@ -1624,10 +1666,19 @@ impl<'db, 'file> Inference<'db, 'file, '_> {
                     return;
                 }
             }
-            if let Some(value_without_final) = value.remove_final(i_s) {
+            if need_additional_narrowing {
+                if false {
+                    // TODO reenable this
+                    self.save_narrowed_initial_name_definition(
+                        PointLink::new(self.file.file_index, current_index),
+                        value.as_type(i_s),
+                    )
+                }
+            }
+            if let Some(value_without_final) = new_declaration_value.remove_final(i_s) {
                 save(name_def.index(), &value_without_final);
             } else {
-                save(name_def.index(), &value);
+                save(name_def.index(), &new_declaration_value);
             }
         }
     }
@@ -1917,7 +1968,7 @@ impl<'db, 'file> Inference<'db, 'file, '_> {
                     Cow::Owned(declaration_t.into_owned().avoid_implicit_literal(i_s.db));
                 save_narrowed.set(false);
             }
-            declaration_t.error_if_not_matches(
+            declaration_t.error_if_not_assignable(
                 i_s,
                 value,
                 |issue| from.add_issue(i_s, issue),
@@ -2139,7 +2190,15 @@ impl<'db, 'file> Inference<'db, 'file, '_> {
                     .as_cow_type(self.i_s)
                     .iter_with_unpacked_unions_and_maybe_include_never(self.i_s.db, true)
                 {
-                    if union_part == &self.i_s.db.python_state.str_type() {
+                    let is_unpacked_string = match union_part {
+                        Type::Class(c) => c.link == self.i_s.db.python_state.str_link(),
+                        Type::Literal(literal) => match literal.value(self.i_s.db) {
+                            LiteralValue::String(s) => s.len() != targets.clone().count(),
+                            _ => false,
+                        },
+                        _ => false,
+                    };
+                    if is_unpacked_string {
                         value_node_ref.add_issue(self.i_s, IssueKind::UnpackingAStringIsDisallowed);
                     }
                     if matches!(union_part, Type::None)
@@ -2509,14 +2568,21 @@ impl<'db, 'file> Inference<'db, 'file, '_> {
         // before F, this might happen.
         let inferred = inferred.maybe_save_redirect(self.i_s, self.file, expr.index(), true);
         if self.flags().disallow_any_expr && !self.file.is_stub() {
-            let t = inferred.as_cow_type(self.i_s);
-            if t.has_any(self.i_s) {
-                self.add_issue(
-                    expr.index(),
-                    IssueKind::DisallowedAnyExpr {
-                        type_: t.format_short(self.i_s.db),
-                    },
-                );
+            // Classes can always have any in them but assigning them should be ok.
+            if inferred
+                .maybe_saved_node_ref(self.i_s.db)
+                .is_none_or(|node_ref| node_ref.maybe_class().is_none())
+            {
+                let t = inferred.as_cow_type(self.i_s);
+                if t.has_any(self.i_s.db) {
+                    debug!("Has any in {:?}: {t:?}", t.format_short(self.i_s.db));
+                    self.add_issue(
+                        expr.index(),
+                        IssueKind::DisallowedAnyExpr {
+                            type_: t.format_short(self.i_s.db),
+                        },
+                    );
+                }
             }
         }
         if result_context.expects_type_form()
@@ -2573,8 +2639,7 @@ impl<'db, 'file> Inference<'db, 'file, '_> {
                     && self.bitwise_or_might_be_a_type(or)
                 {
                     debug!("Found a BitwiseOr expression that looks like a type alias");
-                    let node_ref = NodeRef::from_link(self.i_s.db, *assignment_definition);
-                    let assignment = node_ref.expect_assignment();
+                    let assignment = assignment_definition.as_node(self.i_s.db);
                     if let Some((_, None, _)) = assignment.maybe_simple_type_expression_assignment()
                     {
                         self.compute_explicit_type_assignment(assignment);
@@ -3074,7 +3139,7 @@ impl<'db, 'file> Inference<'db, 'file, '_> {
         self.infer_detailed_operation(op.index, op.infos, left, &right, result_context)
     }
 
-    fn infer_detailed_operation(
+    pub fn infer_detailed_operation(
         &self,
         error_index: NodeIndex,
         op_infos: OpInfos,
@@ -3103,19 +3168,23 @@ impl<'db, 'file> Inference<'db, 'file, '_> {
                         && l_type.is_allowed_as_literal_string(false)
                         && right
                             .as_cow_type(i_s)
-                            .is_literal_string_only_argument_for_string_percent_formatting()
+                            .is_literal_string_only_argument_for_string_percent_formatting(i_s.db)
                     {
                         add_to_union(Inferred::from_type(Type::LiteralString { implicit: true }));
                         return;
                     }
 
                     let left_op_method = lookup_result.lookup.into_maybe_inferred();
-                    for r_type in right.as_cow_type(i_s).iter_with_unpacked_unions(i_s.db) {
+                    let right_full_t = right.as_cow_type(i_s);
+                    for r_type in right_full_t.iter_with_unpacked_unions(i_s.db) {
                         match r_type {
                             Type::Any(cause) => {
                                 return add_to_union(Inferred::new_any(*cause));
                             }
-                            Type::Literal(literal) => {
+                            Type::Literal(literal)
+                                if !(right_full_t.is_union_like(i_s.db)
+                                    && matches!(op_infos.operand, "/" | "//" | "%")) =>
+                            {
                                 if let Some(result) = l_type.try_operation_against_literal(
                                     i_s.db,
                                     op_infos.operand,
@@ -3146,10 +3215,10 @@ impl<'db, 'file> Inference<'db, 'file, '_> {
                                     op_infos.reverse_magic_method,
                                     LookupKind::OnlyType,
                                 );
-                                (Some(l.class), l.lookup.into_maybe_inferred())
+                                (l.class, l.lookup.into_maybe_inferred())
                             }
                             _ => (
-                                None,
+                                TypeOrClass::Type(Cow::Borrowed(r_type)),
                                 r_type
                                     .lookup(
                                         i_s,
@@ -3164,7 +3233,6 @@ impl<'db, 'file> Inference<'db, 'file, '_> {
                             ),
                         };
 
-                        let l_defined_in = Some(&lookup_result.class);
                         let get_strategy = || {
                             // Check for shortcuts first (in Mypy it's called
                             // `op_methods_that_shortcut`)
@@ -3177,9 +3245,9 @@ impl<'db, 'file> Inference<'db, 'file, '_> {
                             }
                             // If right is a sub type of left, Python and Mypy execute right first
                             if r_type.is_simple_sub_type_of(i_s, l_type).bool()
-                                && let Some(TypeOrClass::Class(l_class)) = l_defined_in
-                                && let Some(TypeOrClass::Class(r_class)) = r_defined_in
-                                && l_class.node_ref != r_class.node_ref
+                                && let Some(ldef) = lookup_result.class.defined_at()
+                                && let Some(rdef) = r_defined_in.defined_at()
+                                && ldef != rdef
                             {
                                 return LookupStrategy::ReverseThenNormal;
                             }
@@ -3215,7 +3283,7 @@ impl<'db, 'file> Inference<'db, 'file, '_> {
                             }
                         };
 
-                        let result = match strategy {
+                        let mut result = match strategy {
                             LookupStrategy::ShortCircuit => {
                                 left_op_method.as_ref().and_then(|left| run(left, r_type))
                             }
@@ -3234,6 +3302,26 @@ impl<'db, 'file> Inference<'db, 'file, '_> {
                                     left_op_method.as_ref().and_then(|left| run(left, r_type))
                                 }),
                         };
+                        if op_infos.operand == "|"
+                            && let Some(r) = &result
+                            && (matches!(l_type, Type::Type(_)) || matches!(r_type, Type::Type(_)))
+                            && let Type::Union(union) = r.as_cow_type(i_s).as_ref()
+                        {
+                            let union_type_link = i_s.db.python_state.union_type_link();
+                            // If there is a union link
+                            if union.iter().any(
+                                |t| matches!(t, Type::Class(c) if Some(c.link) == union_type_link),
+                            ) {
+                                result = Some(Inferred::from_type(
+                                    if l_type.is_equal_type(i_s.db, r_type) {
+                                        l_type.clone()
+                                    } else {
+                                        debug_assert!(union_type_link.is_some());
+                                        i_s.db.python_state.union_type().unwrap()
+                                    },
+                                ))
+                            }
+                        }
                         add_to_union(result.unwrap_or_else(|| {
                             let issue = if left_op_method.is_none()
                                 && (right_op_method.is_none()
@@ -3662,6 +3750,9 @@ impl<'db, 'file> Inference<'db, 'file, '_> {
                     return Inferred::from_type(Type::LiteralString { implicit: true });
                 }
                 ProcessedStrings::WithFStringVariables => Specific::String,
+                ProcessedStrings::Inferred(inf) => {
+                    return inf;
+                }
             },
             Bytes(b) => {
                 if let Some(b) = b.maybe_single_bytes_literal() {
@@ -3718,13 +3809,48 @@ impl<'db, 'file> Inference<'db, 'file, '_> {
         Inferred::new_and_save(self.file, atom.index(), point)
     }
 
-    pub(super) fn process_str_literal<'x>(&self, strings: Strings<'x>) -> ProcessedStrings<'x> {
+    fn process_str_literal<'x>(&self, strings: Strings<'x>) -> ProcessedStrings<'x> {
         let mut is_string_literal = true;
+        let mut template_string_count = 0;
+        let mut count = 0;
         for string in strings.iter() {
-            if let StringType::FString(f) = string {
-                is_string_literal &= self
-                    .calc_fstring_content_diagnostics_and_return_is_string_literal(f.iter_content())
+            count += 1;
+            match string {
+                StringType::FString(f) => {
+                    is_string_literal &= self
+                        .calc_fstring_content_diagnostics_and_return_is_string_literal(
+                            f.iter_content(),
+                        );
+                }
+                StringType::TemplateString(_) => {
+                    template_string_count += 1;
+                }
+                StringType::String(_) => {}
             }
+        }
+        if template_string_count > 0 {
+            return ProcessedStrings::Inferred(if template_string_count != count {
+                self.add_issue(
+                    strings.index(),
+                    IssueKind::TemplateStringConcatenatedWithString,
+                );
+                Inferred::new_any_from_error()
+            } else if let Some(template) =
+                self.infer_import_by_strings(&["string", "templatelib", "Template"])
+                && let Some(node_ref) = template.maybe_saved_node_ref(self.i_s.db)
+                && node_ref.maybe_class().is_some()
+            {
+                node_ref.ensure_cached_class_infos(self.i_s);
+                // At this point we have the class, but we need it's instance.
+                Inferred::from_type(
+                    Class::from_undefined_generics(self.i_s.db, node_ref.as_link())
+                        .as_type(self.i_s.db),
+                )
+            } else {
+                // TODO this is a special case where the string.template.Template is not found in
+                // typeshed.
+                Inferred::new_any_from_error()
+            });
         }
         if let Some(s) = strings.maybe_single_string_literal() {
             ProcessedStrings::Literal(s)
@@ -3748,6 +3874,7 @@ impl<'db, 'file> Inference<'db, 'file, '_> {
             }
             ProcessedStrings::LiteralString => Type::LiteralString { implicit: true },
             ProcessedStrings::WithFStringVariables => self.i_s.db.python_state.str_type(),
+            ProcessedStrings::Inferred(inf) => inf.as_type(self.i_s),
         }
     }
 
@@ -3938,7 +4065,7 @@ impl<'db, 'file> Inference<'db, 'file, '_> {
         self.infer_point_resolution(resolved)
     }
 
-    fn infer_point_resolution(&self, pr: PointResolution) -> Inferred {
+    pub(super) fn infer_point_resolution(&self, pr: PointResolution) -> Inferred {
         match pr {
             PointResolution::NameDef {
                 node_ref,
@@ -4043,11 +4170,10 @@ impl<'db, 'file> Inference<'db, 'file, '_> {
                     {
                         return result;
                     }
-                    let r = FLOW_ANALYSIS.with(|fa| {
-                        fa.with_new_empty_without_unfinished_partial_checking(|| {
+                    let r =
+                        FLOW_ANALYSIS.with_new_empty_without_unfinished_partial_checking(|_| {
                             inference.infer_name_def(node_ref.expect_name_def())
-                        })
-                    });
+                        });
                     if !r.unfinished_partials.is_empty() {
                         if let Some(result) = ensure_flow_analysis() {
                             return result;
@@ -4111,14 +4237,12 @@ impl<'db, 'file> Inference<'db, 'file, '_> {
         callable: impl FnOnce(&Inference) -> T,
     ) -> T {
         if global_redirect {
-            FLOW_ANALYSIS.with(|fa| {
-                fa.with_new_empty_and_delay_further(self.i_s.db, || {
-                    callable(
-                        &self
-                            .file
-                            .inference(&InferenceState::new(self.i_s.db, self.file)),
-                    )
-                })
+            FLOW_ANALYSIS.with_new_empty_and_delay_further(self.i_s.db, || {
+                callable(
+                    &self
+                        .file
+                        .inference(&InferenceState::new(self.i_s.db, self.file)),
+                )
             })
         } else {
             callable(self)
@@ -4168,18 +4292,20 @@ impl<'db, 'file> Inference<'db, 'file, '_> {
                     self.use_cached_param_annotation(annotation)
                 } else {
                     let new_any = |param_index| {
-                        if let Some(usage) = func
-                            .type_vars(self.i_s.db)
-                            .find_untyped_param_type_var(func.as_link(), param_index)
-                        {
-                            return Type::TypeVar(usage);
-                        }
-                        if let Some(cls) = func.class
-                            && let Some(usage) = cls
-                                .type_vars(self.i_s)
-                                .find_untyped_param_type_var(cls.as_link(), param_index)
-                        {
-                            return Type::TypeVar(usage);
+                        if self.i_s.db.project.should_infer_untyped_params() {
+                            if let Some(usage) = func
+                                .type_vars(self.i_s.db)
+                                .find_untyped_param_type_var(func.as_link(), param_index)
+                            {
+                                return Type::TypeVar(usage);
+                            }
+                            if let Some(cls) = func.class
+                                && let Some(usage) = cls
+                                    .type_vars(self.i_s)
+                                    .find_untyped_param_type_var(cls.as_link(), param_index)
+                            {
+                                return Type::TypeVar(usage);
+                            }
                         }
                         Type::Any(AnyCause::Unannotated)
                     };
@@ -4257,6 +4383,7 @@ impl<'db, 'file> Inference<'db, 'file, '_> {
             self.file.qualified_name(self.i_s.db),
             name_def.line_one_based(self.i_s.db),
         );
+        let _indent = debug_indent();
         match defining_stmt {
             DefiningStmt::FunctionDef(func_def) => {
                 Function::new(
@@ -4547,7 +4674,7 @@ impl<'db, 'file> Inference<'db, 'file, '_> {
                             type_: &inner_expected,
                         },
                     );
-                    inner_expected.error_if_not_matches_with_matcher(
+                    inner_expected.error_if_not_assignable_with_matcher(
                         i_s,
                         matcher,
                         &inf,
@@ -4578,10 +4705,7 @@ impl<'db, 'file> Inference<'db, 'file, '_> {
             },
             comp,
         );
-        Inferred::from_type(new_class!(
-            self.i_s.db.python_state.list_node_ref().as_link(),
-            t,
-        ))
+        Inferred::from_type(new_class!(self.i_s.db.python_state.list_link(), t,))
     }
 
     fn infer_set_comprehension(
@@ -4598,10 +4722,7 @@ impl<'db, 'file> Inference<'db, 'file, '_> {
             },
             comp,
         );
-        Inferred::from_type(new_class!(
-            self.i_s.db.python_state.set_node_ref().as_link(),
-            t,
-        ))
+        Inferred::from_type(new_class!(self.i_s.db.python_state.set_link(), t,))
     }
 
     pub fn infer_generator_comprehension(
@@ -4609,15 +4730,25 @@ impl<'db, 'file> Inference<'db, 'file, '_> {
         comp: Comprehension,
         result_context: &mut ResultContext,
     ) -> Inferred {
-        let t = self.infer_comprehension_expr_with_context(
-            result_context,
-            self.i_s.db.python_state.generator_node_ref(),
-            |error_types| {
-                let ErrorStrs { expected, got } = error_types.as_boxed_strs(self.i_s.db);
-                IssueKind::GeneratorComprehensionMismatch { got, expected }
-            },
-            comp,
-        );
+        self.wrap_generator_comprehension_result(comp, || {
+            self.infer_comprehension_expr_with_context(
+                result_context,
+                self.i_s.db.python_state.generator_node_ref(),
+                |error_types| {
+                    let ErrorStrs { expected, got } = error_types.as_boxed_strs(self.i_s.db);
+                    IssueKind::GeneratorComprehensionMismatch { got, expected }
+                },
+                comp,
+            )
+        })
+    }
+
+    pub fn wrap_generator_comprehension_result(
+        &self,
+        comp: Comprehension,
+        infer: impl FnOnce() -> Type,
+    ) -> Inferred {
+        let t = infer();
         let (named_expr, for_if_clauses) = comp.unpack();
         let is_async = named_expr.has_await()
             || for_if_clauses
@@ -4745,10 +4876,11 @@ impl<'db, 'file> Inference<'db, 'file, '_> {
     }
 }
 
-pub(super) enum ProcessedStrings<'db> {
+enum ProcessedStrings<'db> {
     Literal(StringLiteral<'db>),
     LiteralString,
     WithFStringVariables,
+    Inferred(Inferred),
 }
 
 pub fn instantiate_except(i_s: &InferenceState, t: &Type) -> Type {
@@ -4857,7 +4989,7 @@ fn gather_except_star(i_s: &InferenceState, t: &Type) -> Type {
 fn get_generator_return_type(i_s: &InferenceState, had_issue: &impl Fn(), t: &Type) -> Type {
     match t {
         Type::Class(c) => {
-            if c.link == i_s.db.python_state.generator_link() {
+            if i_s.db.python_state.is_generator(c.link) {
                 c.class(i_s.db).nth_type_argument(i_s.db, 2)
             } else {
                 had_issue();
@@ -4951,9 +5083,6 @@ pub(crate) fn await_(
     }
     if expect_not_none && matches!(t, Type::None) {
         from.add_issue(i_s, IssueKind::DoesNotReturnAValue("Function".into()));
-        if i_s.db.mypy_compatible() {
-            return Inferred::new_any_from_error();
-        }
     }
     Inferred::from_type(t)
 }
@@ -4993,31 +5122,6 @@ pub(crate) enum AssignKind {
 impl AssignKind {
     fn is_normal_assignment(self) -> bool {
         matches!(self, Self::Normal | Self::Walrus | Self::Pattern)
-    }
-}
-
-pub(crate) enum StarImportResult {
-    Link(PointLink),
-    AnyDueToError,
-}
-
-impl StarImportResult {
-    pub fn as_inferred(&self, i_s: &InferenceState) -> Inferred {
-        match self {
-            Self::Link(link) => {
-                let node_ref = NodeRef::from_link(i_s.db, *link);
-                node_ref.infer_name_of_definition_by_index(i_s)
-            }
-            Self::AnyDueToError => Inferred::new_any_from_error(),
-        }
-    }
-
-    pub fn into_lookup_result(self, i_s: &InferenceState) -> LookupResult {
-        let inf = self.as_inferred(i_s);
-        match self {
-            StarImportResult::Link(link) => LookupResult::GotoName { name: link, inf },
-            StarImportResult::AnyDueToError => LookupResult::UnknownName(inf),
-        }
     }
 }
 

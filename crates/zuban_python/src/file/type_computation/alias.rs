@@ -69,7 +69,11 @@ impl<'db, 'file> NameResolution<'db, 'file, '_> {
 
     fn documentation_for_lookup(&self, lookup: Lookup<'file, 'file>) -> Option<TypeDocs<'file>> {
         match lookup {
-            Lookup::T(TypeContent::TypeAlias(alias)) => Some(TypeDocs::TypeAlias(alias)),
+            Lookup::T(TypeContent::TypeAlias(alias))
+                if alias.is_valid() && !alias.type_if_valid().is_any() =>
+            {
+                Some(TypeDocs::TypeAlias(alias))
+            }
             Lookup::T(TypeContent::Class { node_ref, .. }) => {
                 Some(TypeDocs::SimpleClassTypeAlias(node_ref))
             }
@@ -116,10 +120,9 @@ impl<'db, 'file> NameResolution<'db, 'file, '_> {
             match self.file.points.get(annotation.index()).maybe_specific() {
                 Some(Specific::AnnotationTypeAlias) => cause = AliasCause::TypingTypeAlias,
                 // Final/ClassVar may not have been calculated like x: Final = 1
-                Some(
-                    Specific::AnnotationOrTypeCommentFinal
-                    | Specific::AnnotationOrTypeCommentClassVar,
-                ) => (),
+                Some(specific) if !specific.is_guaranteed_complete_annotation_or_type_comment() => {
+                    ()
+                }
                 _ => {
                     if let Type::Any(cause) = self.use_cached_annotation_type(annotation).as_ref() {
                         return Lookup::T(TypeContent::Unknown(UnknownCause::AnyCause(*cause)));
@@ -191,6 +194,7 @@ impl<'db, 'file> NameResolution<'db, 'file, '_> {
             assignment.maybe_simple_type_expression_assignment()
         {
             debug!("Started type alias calculation: {}", name_def.as_code());
+            let indent = debug_indent();
             if let Some(type_comment) =
                 self.check_for_type_comment_internal(assignment, || point.calculating())
             {
@@ -231,6 +235,7 @@ impl<'db, 'file> NameResolution<'db, 'file, '_> {
             let result = self
                 .compute_special_assignments(assignment, name_def, expr)
                 .unwrap_or_else(check_for_alias);
+            drop(indent);
             debug!("Finished type alias calculation: {}", name_def.as_code());
             result
         } else {
@@ -250,13 +255,13 @@ impl<'db, 'file> NameResolution<'db, 'file, '_> {
                 self.ensure_cached_annotation(annotation, right.is_some());
 
                 // Final/ClassVar may not have been calculated like x: Final = 1
-                if !matches!(
-                    self.file.points.get(annotation.index()).maybe_specific(),
-                    Some(
-                        Specific::AnnotationOrTypeCommentFinal
-                            | Specific::AnnotationOrTypeCommentClassVar,
-                    )
-                ) && let Type::Any(cause) = self.use_cached_annotation_type(annotation).as_ref()
+                if self
+                    .file
+                    .points
+                    .get(annotation.index())
+                    .specific()
+                    .is_guaranteed_complete_annotation_or_type_comment()
+                    && let Type::Any(cause) = self.use_cached_annotation_type(annotation).as_ref()
                 {
                     return Lookup::T(TypeContent::Unknown(UnknownCause::AnyCause(*cause)));
                 }
@@ -314,6 +319,9 @@ impl<'db, 'file> NameResolution<'db, 'file, '_> {
                     &SimpleArgs::new(*self.i_s, self.file, a.primary_index, a.details),
                 ),
                 SpecialAssignmentKind::ParamSpec(a) => self.compute_param_spec_assignment(
+                    &SimpleArgs::new(*self.i_s, self.file, a.primary_index, a.details),
+                ),
+                SpecialAssignmentKind::Sentinel(a) => self.compute_sentinel_assignment(
                     &SimpleArgs::new(*self.i_s, self.file, a.primary_index, a.details),
                 ),
                 SpecialAssignmentKind::TypeOf(args) => {
@@ -390,6 +398,7 @@ impl<'db, 'file> NameResolution<'db, 'file, '_> {
                 Type::None => TypeContent::Type(Type::None),
                 _ => return None,
             },
+            ComplexPoint::TypeInstance(t @ Type::Sentinel(_)) => TypeContent::Type(t.clone()),
             _ => return None,
         }))
     }
@@ -454,6 +463,9 @@ impl<'db, 'file> NameResolution<'db, 'file, '_> {
             ),
             Some(Lookup::T(TypeContent::SpecialCase(Specific::TypingParamSpecClass))) => Ok(
                 SpecialAssignmentKind::ParamSpec(ArgsContent::new(primary.index(), details)),
+            ),
+            Some(Lookup::T(TypeContent::SpecialCase(Specific::BuiltinsSentinel))) => Ok(
+                SpecialAssignmentKind::Sentinel(ArgsContent::new(primary.index(), details)),
             ),
             Some(Lookup::T(TypeContent::SpecialCase(Specific::TypingTypedDict))) => Err(
                 CalculatingAliasType::TypedDict(ArgsContent::new(primary.index(), details)),
@@ -726,6 +738,7 @@ impl<'db, 'file> NameResolution<'db, 'file, '_> {
         expr: Expression,
         cause: AliasCause,
     ) -> Lookup<'file, 'file> {
+        let node_ref = NodeRef::new(self.file, expr.index());
         let in_definition = cached_type_node_ref.as_link();
         let alias = TypeAlias::new(
             type_var_likes,
@@ -733,10 +746,9 @@ impl<'db, 'file> NameResolution<'db, 'file, '_> {
             PointLink::new(self.file.file_index, name_def.name().index()),
             matches!(cause, AliasCause::SyntaxOrTypeAliasType),
         );
-        save_alias(cached_type_node_ref, alias);
-        let ComplexPoint::TypeAlias(alias) = cached_type_node_ref.maybe_complex().unwrap() else {
-            unreachable!()
-        };
+        let alias = save_alias(self.i_s.db, cached_type_node_ref, alias, |issue| {
+            node_ref.add_issue(self.i_s, issue)
+        });
 
         #[allow(clippy::mutable_key_type)]
         let mut unbound_type_vars = FastHashSet::default();
@@ -785,7 +797,6 @@ impl<'db, 'file> NameResolution<'db, 'file, '_> {
             CalculatingAliasType::Normal => {
                 comp.errors_already_calculated = p.calculated();
                 let tc = comp.compute_type(expr);
-                let node_ref = NodeRef::new(self.file, expr.index());
                 match tc {
                     TypeContent::InvalidVariable(_)
                     | TypeContent::Unknown(UnknownCause::UnknownName(_))
@@ -1013,6 +1024,14 @@ impl<'db, 'file> NameResolution<'db, 'file, '_> {
                             return PreClassCalculationLookup::Literal;
                         }
                     }
+                    TypeLike::DottedAsName(dotted) => {
+                        if let Some(ImportResult::File(f)) =
+                            node_ref.file.cache_dotted_as_name_import(db, dotted)
+                            && let Ok(file) = db.ensure_file_for_file_index(f)
+                        {
+                            return PreClassCalculationLookup::Module(file);
+                        }
+                    }
                     _ => (),
                 }
             }
@@ -1170,11 +1189,10 @@ fn load_cached_type(node_ref: NodeRef) -> Lookup {
                 // This means it's a recursive type definition.
                 Lookup::T(TypeContent::RecursiveAlias(node_ref.as_link()))
             } else if !a.is_valid() {
-                let assignment = NodeRef::new(
-                    node_ref.file,
+                let assignment = Assignment::by_index(
+                    &node_ref.file.tree,
                     node_ref.node_index - ASSIGNMENT_TYPE_CACHE_OFFSET,
-                )
-                .expect_assignment();
+                );
                 let name_def = assignment
                     .maybe_simple_type_expression_assignment()
                     .unwrap()
@@ -1279,6 +1297,7 @@ enum SpecialAssignmentKind<'db, 'tree> {
     TypeVar(ArgsContent<'tree>),
     TypeVarTuple(ArgsContent<'tree>),
     ParamSpec(ArgsContent<'tree>),
+    Sentinel(ArgsContent<'tree>),
     TypeOf(ArgsContent<'tree>), // e.g. void = type(None)
     Defaultdict, // This is handled in inference but we need to make sure to not overwrite it
 }
@@ -1339,11 +1358,36 @@ fn check_for_and_replace_type_type_in_finished_alias(
             alias.from_type_syntax,
         );
         alias.set_valid(Type::ERROR, false, false);
-        save_alias(alias_origin, alias)
+        save_alias(i_s.db, alias_origin, alias, |issue| {
+            alias_origin.add_issue(i_s, issue)
+        });
     }
 }
 
-fn save_alias(alias_origin: NodeRef, alias: TypeAlias) {
-    let complex = ComplexPoint::TypeAlias(Box::new(alias));
-    alias_origin.insert_complex(complex, Locality::Todo);
+fn save_alias<'f>(
+    db: &Database,
+    alias_origin: NodeRef<'f>,
+    alias: TypeAlias,
+    add_issue: impl Fn(IssueKind) -> bool,
+) -> &'f TypeAlias {
+    let insert = |alias| {
+        let complex = ComplexPoint::TypeAlias(Box::new(alias));
+        alias_origin.insert_complex(complex, Locality::Todo);
+        let ComplexPoint::TypeAlias(alias) = alias_origin.maybe_complex().unwrap() else {
+            unreachable!()
+        };
+        alias
+    };
+
+    let alias = insert(alias);
+
+    if let Some(new_type_vars) = alias
+        .type_vars
+        .maybe_replace_invalid_type_var_defaults(db, add_issue)
+    {
+        let mut new_alias = (**alias).clone();
+        new_alias.type_vars = new_type_vars;
+        return insert(new_alias);
+    }
+    alias
 }

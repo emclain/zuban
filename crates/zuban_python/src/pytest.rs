@@ -10,7 +10,7 @@ use crate::{
     database::{Database, ParentScope},
     debug,
     file::{ClassNodeRef, File as _, PythonFile, func_parent_scope},
-    imports::{ImportResult, global_import, python_import},
+    imports::{ImportResult, import_module_by_strings, python_import},
     inference_state::InferenceState,
     inferred::Inferred,
     node_ref::NodeRef,
@@ -39,7 +39,7 @@ pub(crate) fn maybe_infer_pytest_param(
     let mut t = func.inferred_return_type(i_s);
     debug!("Executed pytest fixture: {}", t.format_short(db));
     if let Type::Class(c) = t.as_ref()
-        && c.link == db.python_state.generator_link()
+        && db.python_state.is_generator(c.link)
     {
         t = Cow::Owned(c.class(db).nth_type_argument(db, 0));
     }
@@ -114,6 +114,7 @@ fn is_fixture(db: &Database, file: &PythonFile, decorators: Option<Decorators>) 
             // people redefine fixture like `foo = fixture` result in Any, but that's probably
             // fine, since it's not annoying for users.
             dec.as_code().contains("fixture") && {
+                debug!("Found a decorator that might point to a fixture");
                 let i_s = &InferenceState::new(db, file);
                 let inference = file.inference(i_s);
                 // We have to remove the call to `@fixture()`, because otherwise we would not get a
@@ -328,13 +329,8 @@ fn import_dotted<'db>(
     from_file: &PythonFile,
     s: &str,
 ) -> Option<&'db PythonFile> {
-    debug!("Trying to import file {s:?}");
-    let mut iterator = s.split(".");
-    let mut result = global_import(db, from_file, iterator.next()?)?;
-    for module_name in iterator {
-        result = result.import(db, from_file, module_name)?;
-    }
-    match result {
+    debug!("Trying to import dotted file {s:?}");
+    match import_module_by_strings(db, from_file, s.split("."))? {
         ImportResult::File(file_index) => db.ensure_file_for_file_index(file_index).ok(),
         _ => None,
     }

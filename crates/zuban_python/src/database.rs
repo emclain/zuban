@@ -7,8 +7,9 @@ use std::{
 };
 
 use config::{FinalizedTypeCheckerFlags, OverrideConfig, Settings};
-use parsa_python_cst::{NodeIndex, Tree};
+use parsa_python_cst::{NodeIndex, Scope, Tree};
 use rayon::prelude::*;
+use utils::FastHashSet;
 use vfs::{
     AbsPath, DirOrFile, Directory, DirectoryEntry, Entries, FileEntry, FileIndex,
     InvalidationResult, LocalFS, NormalizedPath, PathWithScheme, Vfs, VfsFile as _, VfsHandler,
@@ -25,8 +26,8 @@ use crate::{
     type_::{
         CallableContent, DataclassTransformObj, FunctionKind, FunctionOverload, GenericItem,
         GenericsList, ParamSpecUsage, RecursiveType, ReplaceTypeVarLikes, StringSlice, Type,
-        TypeVarLike, TypeVarLikeUsage, TypeVarLikes, TypeVarName, TypeVarTupleUsage, TypeVarUsage,
-        TypedDict, Variance,
+        TypeVarLike, TypeVarLikeName, TypeVarLikeUsage, TypeVarLikes, TypeVarTupleUsage,
+        TypeVarUsage, TypedDict, Variance,
     },
     type_helpers::{Class, Function},
     utils::SymbolTable,
@@ -58,6 +59,9 @@ const NEEDS_FLOW_ANALYSIS_MASK: u32 = 1 << NEEDS_FLOW_ANALYSIS_BIT_INDEX;
 const LOCALITY_MASK: u32 = 0b111 << LOCALITY_BIT_INDEX;
 const KIND_MASK: u32 = 0b111 << KIND_BIT_INDEX;
 
+const FUNCTION_CHECKED_INDEX: u32 = SPECIFIC_BIT_LEN + 1;
+const FUNCTION_CHECKED_MASK: u32 = 1 << FUNCTION_CHECKED_INDEX;
+
 const PARTIAL_NULLABLE_INDEX: u32 = SPECIFIC_BIT_LEN + 1;
 const PARTIAL_NULLABLE_MASK: u32 = 1 << PARTIAL_NULLABLE_INDEX;
 const PARTIAL_REPORTED_ERROR_INDEX: u32 = SPECIFIC_BIT_LEN + 2;
@@ -79,7 +83,10 @@ pub(crate) struct Point {
 impl Point {
     #[inline]
     fn calculate_flags(kind: PointKind, rest: u32, locality: Locality) -> u32 {
-        debug_assert!(rest & !REST_MASK == 0);
+        debug_assert!(
+            rest & !REST_MASK == 0,
+            "rest: {rest}, rest mask: {REST_MASK}"
+        );
         rest | IS_ANALIZED_MASK
             | (locality as u32) << LOCALITY_BIT_INDEX
             | (kind as u32) << KIND_BIT_INDEX
@@ -130,6 +137,7 @@ impl Point {
     }
 
     pub fn new_complex_point(complex_index: u32, locality: Locality) -> Self {
+        assert!(complex_index <= REST_MASK);
         let flags = Self::calculate_flags(PointKind::Complex, complex_index, locality);
         Self {
             flags,
@@ -312,6 +320,17 @@ impl Point {
         unsafe { mem::transmute(self.flags & SPECIFIC_MASK) }
     }
 
+    pub fn function_was_checked(self) -> bool {
+        debug_assert!(self.specific().is_function_state());
+        (self.flags & FUNCTION_CHECKED_MASK) > 0
+    }
+
+    pub fn set_checked_function(mut self) -> Self {
+        debug_assert!(self.specific().is_function_state());
+        self.flags |= 1 << FUNCTION_CHECKED_INDEX;
+        self
+    }
+
     pub fn partial_flags(self) -> PartialFlags {
         debug_assert!(self.specific().is_partial(), "{:?}", self);
         PartialFlags {
@@ -367,6 +386,9 @@ impl fmt::Debug for Point {
                     s.field("partial: nullable", &partial.nullable);
                     s.field("partial: reported_error", &partial.reported_error);
                     s.field("partial: finished", &partial.finished);
+                }
+                if specific.is_function_state() {
+                    s.field("function_was_checked", &self.function_was_checked());
                 }
             }
             if self.kind() == PointKind::Redirect || self.kind() == PointKind::FileReference {
@@ -463,15 +485,17 @@ pub(crate) enum Specific {
     Analyzed, // Signals that a node has been analyzed
     Calculating,
     Cycle,
+    UntypedFunctionSelfAssignment,
     FirstNameOfNameDef, // Cycles for the same name definition in e.g. different branches
     NameOfNameDef,      // Cycles for the same name definition in e.g. different branches
     Parent,             // Has a link to the parent scope
+    FunctionEndIsReachable,
     FunctionEndIsUnreachable,
     OverloadUnreachable,
     AnyDueToError,
     InvalidTypeDefinition,
     ModuleNotFound,
-    PyTypedMissing,
+    BinaryExtension,
     IfBranchAlwaysReachableInNameBinder,
     IfBranchAlwaysReachableInTypeCheckingBlock, // For if TYPE_CHECKING:
     IfBranchAfterAlwaysReachableInNameBinder,
@@ -543,6 +567,7 @@ pub(crate) enum Specific {
     TypingTypeGuard,
     TypingTypeIs,
     TypingTypeForm,
+    BuiltinsSentinel,
     RevealTypeFunction,
     AssertTypeFunction,
     TypingNamedTuple,      // typing.NamedTuple
@@ -591,6 +616,13 @@ impl Specific {
         )
     }
 
+    pub fn is_function_state(self) -> bool {
+        matches!(
+            self,
+            Specific::FunctionEndIsReachable | Specific::FunctionEndIsUnreachable
+        )
+    }
+
     pub fn might_be_used_in_alias(self) -> bool {
         matches!(
             self,
@@ -617,6 +649,15 @@ impl Specific {
                 | Specific::AnnotationOrTypeCommentWithTypeVars
                 | Specific::AnnotationOrTypeCommentClassVar
                 | Specific::AnnotationOrTypeCommentFinal
+        )
+    }
+
+    pub fn is_guaranteed_complete_annotation_or_type_comment(self) -> bool {
+        matches!(
+            self,
+            Specific::AnnotationOrTypeCommentSimpleClassInstance
+                | Specific::AnnotationOrTypeCommentWithoutTypeVars
+                | Specific::AnnotationOrTypeCommentWithTypeVars
         )
     }
 }
@@ -696,6 +737,10 @@ pub(crate) enum ComplexPoint {
     // Sometimes needed when a Final is defined in a class and initialized in __init__.
     IndirectFinal(Arc<Type>),
     WidenedType(Arc<WidenedType>),
+    // Only used for heuristics, this is not relevant for non-heuristic inference
+    HeuristicBound(Arc<HeuristicBound>),
+    // If a third-party library is missing a py.typed, this is the resulting location redirect.
+    PyTypedMissing(PyTypedMissing),
 
     // Relevant for types only (not inference)
     TypeVarLike(TypeVarLike),
@@ -732,7 +777,7 @@ impl OverloadImplementation {
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct OverloadDefinition {
     pub implementation: Option<OverloadImplementation>,
-    pub functions: Arc<FunctionOverload>,
+    pub functions: FunctionOverload,
     pub is_final: bool,    // Had @final
     pub is_override: bool, // Had @override
     pub dataclass_transform: Option<DataclassTransformObj>,
@@ -745,6 +790,13 @@ impl OverloadDefinition {
 
     pub fn kind(&self) -> &FunctionKind {
         self.functions.kind()
+    }
+
+    pub fn is_abstract(&self) -> bool {
+        self.implementation
+            .as_ref()
+            .is_some_and(|i| i.callable.is_abstract)
+            || self.functions.is_abstract()
     }
 }
 
@@ -940,7 +992,7 @@ impl TypeAlias {
                     (t.in_definition() == self.location)
                         .then(|| t.as_default_or_any_generic_item(db))
                 })
-                .unwrap_or_else(|| type_.clone())
+                .into_owned()
         }
     }
 
@@ -1040,6 +1092,7 @@ impl Database {
             settings: options.settings,
             flags: options.flags.finalize(),
             overrides: options.overrides,
+            ignored_global_imports: Default::default(),
         };
 
         let mut workspace_builder = WorkspacesBuilder::new(&*vfs_handler);
@@ -1119,7 +1172,7 @@ impl Database {
 
         this.generate_python_state();
 
-        tracing::debug!(
+        tracing::info!(
             "Workspace base paths: {:?}",
             this.vfs
                 .workspaces
@@ -1146,6 +1199,7 @@ impl Database {
             settings: options.settings,
             flags: options.flags.finalize(),
             overrides: options.overrides,
+            ignored_global_imports: Default::default(),
         };
 
         let mut mypy_path_iter = project.settings.mypy_path.iter().map(|p| &**p);
@@ -1170,7 +1224,7 @@ impl Database {
                 .vfs
                 .add_workspace_without_full_access(p1.clone(), *kind);
         }
-        tracing::debug!(
+        tracing::info!(
             "Workspace base paths (for reused project): {:?}",
             new_db
                 .vfs
@@ -1323,6 +1377,7 @@ impl Database {
                 file.super_file = Some(SuperFile {
                     file: parent,
                     offset: None,
+                    ignore_diagnostics: false,
                 });
                 file.invalidate_references_to(super_file)
             }
@@ -1338,7 +1393,11 @@ impl Database {
                     file_entry,
                     new_code,
                 );
-                file.super_file = parent.map(|file| SuperFile { file, offset: None });
+                file.super_file = parent.map(|file| SuperFile {
+                    file,
+                    offset: None,
+                    ignore_diagnostics: false,
+                });
                 file
             },
         );
@@ -1465,6 +1524,10 @@ impl Database {
             .unwrap_or_else(|| panic!("Unable to read {file_name:?} in {}", as_debug_path()));
         debug!("Preloaded typeshed stub {file_name} as #{}", file_index.0);
         self.loaded_python_file(file_index)
+    }
+
+    pub fn is_file_index_loaded(&self, index: FileIndex) -> bool {
+        self.vfs.file(index).is_some()
     }
 
     pub fn loaded_python_file(&self, index: FileIndex) -> &PythonFile {
@@ -1628,12 +1691,21 @@ fn add_workspace_and_check_for_pth_files(
                         let path =
                             handler.normalize_rc_path(handler.absolute_path(&workspace_path, line));
                         tracing::info!("Add entry {path} in .pth file: {}", pth_path.as_uri());
+                        // Sometimes pth files link to subfolders of the current workspace. In that
+                        // case we want this to still be a type checked (nested) workspace.
+                        let kind = if workspaces_builder
+                            .path_is_contained_in_type_checking_folder(&path)
+                        {
+                            WorkspaceKind::TypeChecking
+                        } else {
+                            WorkspaceKind::SitePackages
+                        };
                         add_workspace_and_check_for_pth_files(
                             handler,
                             workspaces_builder,
                             path,
                             is_recovery,
-                            WorkspaceKind::SitePackages,
+                            kind,
                         )
                     }
                 }
@@ -1648,6 +1720,8 @@ pub(crate) struct PythonProject {
     pub settings: Settings,
     pub flags: FinalizedTypeCheckerFlags,
     pub(crate) overrides: Vec<OverrideConfig>,
+    // This is calculated from overrides
+    ignored_global_imports: OnceLock<FastHashSet<Box<str>>>,
     // is_django: bool,  // TODO maybe add?
 }
 
@@ -1663,6 +1737,15 @@ impl PythonProject {
 
     pub fn should_infer_return_types(&self) -> bool {
         self.settings.should_infer_return_types() && self.flags.check_untyped_defs
+    }
+
+    pub fn ignored_global_imports(&self) -> &FastHashSet<Box<str>> {
+        self.ignored_global_imports.get_or_init(|| {
+            FastHashSet::from_iter(self.overrides.iter().filter_map(|override_| {
+                let name = override_.module.maybe_affects_global_import_name()?;
+                override_.has_ignore_missing_imports().then(|| name.into())
+            }))
+        })
     }
 }
 
@@ -1700,6 +1783,15 @@ impl ParentScope {
             .line_one_based();
         // Add the position like `foo.Bar@7`
         format!("{}.{name}@{line}", defined_at.file.qualified_name(db))
+    }
+
+    pub fn from_scope(scope: Scope) -> Self {
+        match scope {
+            Scope::Module => Self::Module,
+            Scope::Class(class_def) => Self::Class(class_def.index()),
+            Scope::Function(function_def) => Self::Function(function_def.index()),
+            Scope::Lambda(lambda) => Self::from_scope(lambda.parent_scope()),
+        }
     }
 }
 
@@ -1756,10 +1848,11 @@ pub(crate) struct ClassInfos {
     pub abstract_attributes: Box<[PointLink]>,
     pub in_django_stubs: OnceLock<bool>,
     pub dataclass_transform: Option<Box<DataclassTransformObj>>,
+    pub disjoint_base: PointLink,
     pub promote_to: Mutex<Option<PointLink>>,
     pub deprecated_reason: Option<Arc<Box<str>>>,
     // Does not need to be a HashMap, because this is typically the size of 1-2
-    pub variance_map: Vec<(TypeVarName, OnceLock<Variance>)>,
+    pub variance_map: Vec<(TypeVarLikeName, OnceLock<Variance>)>,
     // We have this less for caching and more to be able to have different types.
     pub undefined_generics_type: OnceLock<Arc<Type>>,
 }
@@ -1779,6 +1872,7 @@ impl Clone for ClassInfos {
             abstract_attributes: self.abstract_attributes.clone(),
             in_django_stubs: self.in_django_stubs.clone(),
             dataclass_transform: self.dataclass_transform.clone(),
+            disjoint_base: self.disjoint_base,
             promote_to: Mutex::new(*self.promote_to.lock().unwrap()),
             deprecated_reason: self.deprecated_reason.clone(),
             variance_map: self.variance_map.clone(),
@@ -1800,6 +1894,7 @@ impl PartialEq for ClassInfos {
             && self.is_runtime_checkable == other.is_runtime_checkable
             && self.abstract_attributes == other.abstract_attributes
             && self.dataclass_transform == other.dataclass_transform
+            && self.disjoint_base == other.disjoint_base
             && *self.promote_to.lock().unwrap() == *other.promote_to.lock().unwrap()
             && self.deprecated_reason == other.deprecated_reason
             && self.variance_map == other.variance_map
@@ -1842,6 +1937,18 @@ impl std::cmp::PartialEq for ClassStorage {
         recoverable_error!("Should never compare  class storage with ==");
         false
     }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum PyTypedMissing {
+    File(FileIndex),
+    Link(PointLink),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct HeuristicBound {
+    pub type_: Type,
+    pub bound_to: Type,
 }
 
 #[cfg(test)]
