@@ -65,6 +65,9 @@ cargo build
 # Run Rust tests
 cargo test
 
+# Create jedi's Python venv, which the rename tests run in (agent-start.sh does this)
+bash scripts/setup-jedi-venv.sh
+
 # Run jedi rename fixture tests against zuban
 # (sets ZUBAN_TYPESHED automatically; requires ../jedi to be checked out. ../jedi is
 # read-only for zuban agents — see "Changes in jedi" in MULTI_AGENT.md)

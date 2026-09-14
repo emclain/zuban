@@ -52,11 +52,7 @@ if [ ! -d "$JEDI_DIR" ]; then
   echo "Cloning jedi alongside zuban..."
   git clone https://github.com/emclain/jedi "$JEDI_DIR" --branch refactoring-test-coverage
 fi
-if [ ! -d "$JEDI_DIR/.venv" ]; then
-  echo "Setting up jedi Python venv..."
-  python3 -m venv "$JEDI_DIR/.venv"
-  "$JEDI_DIR/.venv/bin/pip" install -q -e "$JEDI_DIR/[testing]"
-fi
+bash "$REPO_ROOT/scripts/setup-jedi-venv.sh" "$JEDI_DIR"
 
 # ── 4. Fast-forward the primary checkout ─────────────────────────────────────
 # Worktrees branch from origin/jedi-compare directly; this only keeps the hub's

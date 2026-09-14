@@ -57,8 +57,17 @@ if [[ ! -d "$TYPESHED" ]]; then
     exit 1
 fi
 
+# Use jedi's venv, not python3 from PATH, which may lack pytest or jedi's
+# test deps.
+PYTHON="$JEDI_DIR/.venv/bin/python"
+if [[ ! -x "$PYTHON" ]]; then
+    echo "Error: no Python venv at $JEDI_DIR/.venv. Create it with:" >&2
+    echo "  bash $SCRIPT_DIR/setup-jedi-venv.sh $JEDI_DIR" >&2
+    exit 1
+fi
+
 echo "Running jedi rename tests against $BINARY..."
 cd "$JEDI_DIR"
-ZUBAN_TYPESHED="$TYPESHED" python3 -m pytest test/test_lsp_rename.py \
+ZUBAN_TYPESHED="$TYPESHED" "$PYTHON" -m pytest test/test_lsp_rename.py \
     --lsp-cmd="$BINARY server" \
     "${PYTEST_ARGS[@]}"
