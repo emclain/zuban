@@ -2,11 +2,15 @@
 # agent-start.sh — Bootstrap a multi-agent session and claim one issue.
 #
 # Usage (from the primary checkout):
-#   bash scripts/agent-start.sh
+#   bash scripts/agent-start.sh                     # claim the top ready issue
+#   bash scripts/agent-start.sh <issue-id>          # claim this issue
+#   bash scripts/agent-start.sh --no-claim [<name>] # claim nothing
 #
 # The primary checkout is a coordination hub that no agent edits. This script
 # fast-forwards it to origin/jedi-compare, makes sure the shared beads Dolt
 # server is running, claims one issue, and creates an isolated worktree for it.
+# With --no-claim it does all of that except the claim, for work that isn't a
+# tracked issue; the worktree is named after <name> (default: a timestamp).
 #
 # On success, prints the worktree path and the claimed issue id.
 # On "no work available", exits 0 with a message.
@@ -15,6 +19,43 @@
 # See MULTI_AGENT.md for the full procedure.
 
 set -euo pipefail
+
+usage() {
+  sed -n 's/^#   //p' "$0" | sed 's/^/  /'
+}
+
+requested_id=""
+no_claim=0
+work_name=""
+case "${1:-}" in
+  "")
+    ;;
+  -h|--help)
+    echo "Usage (from the primary checkout):"
+    usage
+    exit 0
+    ;;
+  --no-claim)
+    no_claim=1
+    work_name="${2:-session-$(date +%Y%m%d-%H%M%S)}"
+    [ $# -le 2 ] || { echo "ERROR: too many arguments." >&2; usage >&2; exit 1; }
+    ;;
+  -*)
+    echo "ERROR: unknown option '$1'." >&2
+    usage >&2
+    exit 1
+    ;;
+  *)
+    requested_id="$1"
+    [ $# -le 1 ] || { echo "ERROR: too many arguments." >&2; usage >&2; exit 1; }
+    ;;
+esac
+# The name becomes a directory and a branch, so keep it to one plain segment.
+if [ "$no_claim" -eq 1 ] && ! { [[ "$work_name" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] &&
+    git check-ref-format "refs/heads/work/$work_name"; }; then
+  echo "ERROR: --no-claim name '$work_name' must be letters, digits, '.', '_' or '-'." >&2
+  exit 1
+fi
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO_ROOT"
@@ -98,42 +139,74 @@ fi
 # ── 6. Claim one issue ───────────────────────────────────────────────────────
 # `bd update --claim` is idempotent for the same actor, and bd's default actor
 # is git user.name — shared by every agent in this environment. Without a
-# unique actor, every agent would "win" the same issue.
+# unique actor, every agent would "win" the same issue. --no-claim sessions get
+# one too, in case they claim something later.
 export BEADS_ACTOR="agent-$(hostname)-$$"
-ready_json="$(bd ready --json --limit 10)"
 claimed=""
-for id in $(jq -r '.[].id' <<<"$ready_json"); do
-  if claim_err="$(bd update "$id" --claim 2>&1 >/dev/null)"; then
-    claimed="$id"
-    break
+if [ "$no_claim" -eq 1 ]; then
+  echo "Not claiming an issue (--no-claim)."
+elif [ -n "$requested_id" ]; then
+  if ! issue_json="$(bd show "$requested_id" --json 2>/dev/null)"; then
+    echo "ERROR: no issue matches '$requested_id'." >&2
+    exit 1
   fi
-  # Losing a claim race is expected; any other failure is not.
-  if [ "$(bd show "$id" --json | jq -r '.[0].status')" = "in_progress" ]; then
-    continue
+  # bd resolves partial ids; the worktree and branch use the full one.
+  requested_id="$(jq -r '.[0].id' <<<"$issue_json")"
+  status="$(jq -r '.[0].status' <<<"$issue_json")"
+  if [ "$status" = "closed" ]; then
+    echo "ERROR: $requested_id is closed. Reopen it first if it needs more work:" >&2
+    echo "  bd update $requested_id --status open" >&2
+    exit 1
   fi
-  echo "ERROR: claiming $id failed: $claim_err" >&2
-  exit 1
-done
+  if ! claim_err="$(bd update "$requested_id" --claim 2>&1 >/dev/null)"; then
+    echo "ERROR: claiming $requested_id failed (status: $status," \
+      "assignee: $(jq -r '.[0].assignee // "none"' <<<"$issue_json")): $claim_err" >&2
+    exit 1
+  fi
+  claimed="$requested_id"
+else
+  ready_json="$(bd ready --json --limit 10)"
+  for id in $(jq -r '.[].id' <<<"$ready_json"); do
+    if claim_err="$(bd update "$id" --claim 2>&1 >/dev/null)"; then
+      claimed="$id"
+      break
+    fi
+    # Losing a claim race is expected; any other failure is not.
+    if [ "$(bd show "$id" --json | jq -r '.[0].status')" = "in_progress" ]; then
+      continue
+    fi
+    echo "ERROR: claiming $id failed: $claim_err" >&2
+    exit 1
+  done
 
-if [ -z "$claimed" ]; then
-  echo "No available work — all issues are claimed or done."
-  exit 0
+  if [ -z "$claimed" ]; then
+    echo "No available work — all issues are claimed or done."
+    exit 0
+  fi
 fi
 
-echo "Claimed issue: $claimed"
-
 # ── 7. Create isolated worktree ──────────────────────────────────────────────
-worktree="../zuban-${claimed}"
-worktree_abs="$(cd .. && pwd)/zuban-${claimed}"
+if [ -n "$claimed" ]; then
+  echo "Claimed issue: $claimed"
+  work_name="$claimed"
+fi
+worktree="../zuban-${work_name}"
+worktree_abs="$(cd .. && pwd)/zuban-${work_name}"
 
-# Clean up stale worktree from a prior crashed run
-if [ -d "$worktree" ]; then
+if [ -d "$worktree" ] || git show-ref --verify --quiet "refs/heads/work/$work_name"; then
+  if [ -z "$claimed" ]; then
+    # Nothing marks an unclaimed worktree as abandoned, so never delete one.
+    echo "ERROR: $worktree or branch work/$work_name already exists. Pick another name," >&2
+    echo "or work in the existing worktree." >&2
+    exit 1
+  fi
+  # A claimed issue's leftover worktree is from a prior crashed or blocked run.
   echo "Stale worktree found at $worktree — removing..."
   git worktree remove --force "$worktree" 2>/dev/null || true
   git branch -D "work/$claimed" 2>/dev/null || true
 fi
 
-git worktree add "$worktree" -b "work/$claimed" origin/jedi-compare
+git worktree add "$worktree" -b "work/$work_name" origin/jedi-compare
 
 # Git worktrees do NOT inherit submodule contents — initialize them now.
 echo "Initializing submodules in worktree..."
@@ -142,8 +215,18 @@ git -C "$worktree" submodule update --init
 echo "Worktree created at: $worktree_abs"
 
 # ── 8. Write .agent-env ──────────────────────────────────────────────────────
+# agent-land.sh lands work/$CLAIMED_ID and closes it, or work/$WORK_NAME when
+# CLAIMED_ID is unset. Each form unsets the other variable, so one left in the
+# shell by another worktree's .agent-env can't take over.
+if [ -n "$claimed" ]; then
+  id_lines="unset WORK_NAME
+export CLAIMED_ID=$claimed"
+else
+  id_lines="unset CLAIMED_ID
+export WORK_NAME=$work_name"
+fi
 cat > "$worktree/.agent-env" <<EOF
-export CLAIMED_ID=$claimed
+$id_lines
 export BEADS_ACTOR="$BEADS_ACTOR"
 export ZUBAN_TYPESHED=$worktree_abs/third_party/typeshed
 export JEDI_DIR=$JEDI_DIR
@@ -154,7 +237,7 @@ echo ""
 echo "Ready. Run the following to start work:"
 echo "  cd $worktree_abs"
 echo "  source .agent-env"
-echo "  bd show $claimed"
+[ -z "$claimed" ] || echo "  bd show $claimed"
 echo ""
 echo "When done (work committed), land with:"
 echo "  bash scripts/agent-land.sh"

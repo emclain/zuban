@@ -38,11 +38,13 @@ bash scripts/agent-start.sh
 
 If the script prints a worktree path, `cd` there and continue. If it prints "No available work", stop. If it fails because another instance was starting at the same moment (a git lock error), run it again.
 
+To claim a specific issue rather than the top ready one, pass its id: `bash scripts/agent-start.sh <id>`. For work that is not a tracked issue, such as a change a user asks for directly, `bash scripts/agent-start.sh --no-claim [<name>]` does everything except the claim, in `../zuban-<name>` on `work/<name>`; `agent-land.sh` lands that worktree the same way, minus closing an issue.
+
 What it does: checks for `bd`, `dolt`, `jq` and `cargo`; fast-forwards the primary checkout; starts the beads server (`bd dolt start`, bootstrapping the database on a fresh checkout); claims the highest-priority ready issue under a unique `BEADS_ACTOR`; creates `../zuban-<id>` on branch `work/<id>` from `origin/jedi-compare` with submodules initialized; and writes `.agent-env` into it.
 
 ```bash
 cd ../zuban-<id>
-source .agent-env   # sets CLAIMED_ID, BEADS_ACTOR, ZUBAN_TYPESHED, JEDI_DIR, CARGO_TARGET_DIR
+source .agent-env   # sets CLAIMED_ID (WORK_NAME with --no-claim), BEADS_ACTOR, ZUBAN_TYPESHED, JEDI_DIR, CARGO_TARGET_DIR
 ```
 
 ### 2. Work (in the worktree)

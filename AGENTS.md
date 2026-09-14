@@ -79,7 +79,7 @@ bash scripts/run_jedi_rename_tests.sh
 
 ## Multi-Agent Parallelism
 
-When multiple instances are running in one environment, see **[MULTI_AGENT.md](MULTI_AGENT.md)** for the full procedure. In brief: run `bash scripts/agent-start.sh` in the primary checkout to claim one issue and get a worktree, work in that worktree, and land with `bash scripts/agent-land.sh`. Never edit files or commit in the primary checkout — it holds the shared beads server, and `agent-start.sh` only fast-forwards it.
+When multiple instances are running in one environment, see **[MULTI_AGENT.md](MULTI_AGENT.md)** for the full procedure. In brief: run `bash scripts/agent-start.sh` in the primary checkout to claim one issue and get a worktree (pass an issue id to pick it, or `--no-claim` for work that isn't an issue), work in that worktree, and land with `bash scripts/agent-land.sh`. Never edit files or commit in the primary checkout — it holds the shared beads server, and `agent-start.sh` only fast-forwards it.
 
 **Each agent works on exactly one issue, then stops.**
 

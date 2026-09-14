@@ -5,6 +5,8 @@
 #   bash scripts/agent-land.sh
 #
 # Reads CLAIMED_ID from the environment (source .agent-env first) or pass as $1.
+# A worktree from `agent-start.sh --no-claim` sets WORK_NAME instead, and lands
+# the same way except that there is no issue to close.
 # Must be run from the worktree (not the primary checkout).
 
 set -euo pipefail
@@ -25,10 +27,12 @@ if ! git rev-parse --git-common-dir &>/dev/null; then
 fi
 
 claimed="${1:-${CLAIMED_ID:-}}"
-if [ -z "$claimed" ]; then
+work_name="${claimed:-${WORK_NAME:-}}"
+if [ -z "$work_name" ]; then
   echo "ERROR: pass the issue id as \$1 or set CLAIMED_ID (source .agent-env)." >&2
   exit 1
 fi
+branch="work/$work_name"
 
 git_common="$(git rev-parse --path-format=absolute --git-common-dir)"
 if [ "$(git rev-parse --path-format=absolute --git-dir)" = "$git_common" ]; then
@@ -38,6 +42,11 @@ fi
 MAIN_CHECKOUT="$(dirname "$git_common")"
 WORKTREE_ROOT="$(git rev-parse --show-toplevel)"
 cd "$WORKTREE_ROOT"
+# The cleanup below removes this worktree, so it must be the one being landed.
+if [ "$(git branch --show-current)" != "$branch" ]; then
+  echo "ERROR: this worktree is on '$(git branch --show-current)', not $branch." >&2
+  exit 1
+fi
 
 if ! git -C "$MAIN_CHECKOUT" rev-parse --git-dir &>/dev/null; then
   _add_safe_dirs "$MAIN_CHECKOUT"
@@ -72,7 +81,7 @@ commit_export() {
   bd export > .beads/issues.jsonl
   git add .beads/issues.jsonl
   if ! git diff --cached --quiet -- .beads/issues.jsonl; then
-    git commit -m "bd sync: update issues.jsonl after $claimed"
+    git commit -m "bd sync: update issues.jsonl after $work_name"
   fi
 }
 
@@ -92,22 +101,24 @@ cargo test
 # stops on a conflict never leaves a closed issue behind.
 echo "=== Pushing code ==="
 merge_origin
-until git push origin "work/$claimed:jedi-compare"; do
+until git push origin "$branch:jedi-compare"; do
   echo "Push rejected — another instance landed first, retrying..."
   sleep 1
   merge_origin
 done
 
 # ── 3. Close the issue ───────────────────────────────────────────────────────
-echo "=== Closing $claimed ==="
-bd close "$claimed"
+if [ -n "$claimed" ]; then
+  echo "=== Closing $claimed ==="
+  bd close "$claimed"
+fi
 
 # ── 4. Persist beads state ───────────────────────────────────────────────────
 # Both are required (see "Beads Database" in MULTI_AGENT.md): the jsonl export
 # for git, and bd dolt push for the Dolt history that `bd bootstrap` restores.
 echo "=== Persisting beads state ==="
 commit_export
-until git push origin "work/$claimed:jedi-compare"; do
+until git push origin "$branch:jedi-compare"; do
   echo "Push rejected — retrying..."
   sleep 1
   merge_origin
@@ -128,14 +139,14 @@ done
 echo "=== Cleaning up ==="
 cd "$MAIN_CHECKOUT"
 git worktree remove --force "$WORKTREE_ROOT"
-git branch -d "work/$claimed"
+git branch -d "$branch"
 
 if [ "$dolt_pushed" -ne 1 ]; then
   echo "" >&2
-  echo "ERROR: $claimed landed in git, but bd dolt push failed. Run it from $MAIN_CHECKOUT:" >&2
+  echo "ERROR: $work_name landed in git, but bd dolt push failed. Run it from $MAIN_CHECKOUT:" >&2
   echo "  bd dolt push" >&2
   exit 1
 fi
 
 echo ""
-echo "✓ $claimed landed successfully."
+echo "✓ $work_name landed successfully."
