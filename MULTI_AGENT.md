@@ -11,14 +11,14 @@ Multiple Claude instances can work in parallel in one environment by combining b
 
 ## The Primary Checkout
 
-The primary checkout (the directory holding `.git/`, e.g. `dev/zuban`) is a coordination hub. **No agent edits files in it or commits from it.** It holds shared state that every instance uses:
+The primary checkout (the directory holding `.git/`, e.g. `dev/zuban`) is a coordination hub. **No agent edits files in it or commits from it** (running `bd` there is fine; it only touches the database). It holds shared state that every instance uses:
 
 - **The beads database and server.** Every worktree resolves `.beads/` to the primary's through git's common directory, so all `bd` commands reach the server running from the primary's `.beads/dolt/` (PID, port and log files sit beside it; all gitignored).
 - **Its own `jedi-compare` branch and working tree.** `agent-start.sh` fast-forwards them to `origin/jedi-compare`, which is how script and `.beads` config changes pushed by other agents reach the hub. It refuses to run if the primary has uncommitted changes or local commits.
 - **Worktree bookkeeping.** Creating and removing worktrees and `work/<id>` branches changes `.git/`; the worktrees themselves live beside it as `../zuban-<id>`.
 - **A one-time build.** `agent-start.sh` builds `target/debug/zuban` in the primary if it is missing.
 
-Shared outside the primary: `../jedi` and its `.venv`, which `agent-start.sh` clones and creates if missing and every instance's rename tests run in. Worktrees do not isolate it — two instances changing jedi files (such as `test/lsp_compat.py`) would edit the same working tree.
+**`../jedi` is read-only for zuban agents.** It is jedi's own primary checkout (jedi runs this same workflow; see its MULTI_AGENT.md). `agent-start.sh` clones it and creates its `.venv` if missing, and `scripts/run_jedi_rename_tests.sh` runs the rename tests there — but no zuban agent edits or commits in it. Changes zuban needs in jedi go through jedi's tracker; see [Changes in jedi](#changes-in-jedi). jedi's own agents fast-forward that checkout, so a rename test run can see its files change mid-run.
 
 ## One Issue Per Session
 
@@ -59,6 +59,22 @@ git add <files>
 git commit -m "<message>"
 ```
 
+#### Changes in jedi
+
+The rename test driver (`test/test_lsp_rename.py`), the adapter (`test/lsp_compat.py`) and the rename fixtures live in jedi, not here. If your issue needs a change in jedi, do not edit `../jedi`. File the change in jedi's tracker, mark this issue blocked, and stop:
+
+```bash
+bd -C ../jedi create --title="..." --description="Needed by $CLAIMED_ID: ..." --type=task --priority=<n>
+bd note $CLAIMED_ID "Blocked on <jedi-id>: <what jedi needs to change>"
+bd update $CLAIMED_ID --status blocked
+bd -C ../jedi dolt push
+bd dolt push
+```
+
+Those writes reach every local agent immediately through the beads servers, but reach origin only through `bd dolt push` — and a blocked issue has no landing to run it, so run both pushes yourself (re-run one that fails). The git-tracked `.beads/issues.jsonl` in each repo catches up at that repo's next landing, whose export includes everything in its database.
+
+Do not run `agent-land.sh` for a blocked issue. If the worktree holds nothing worth keeping, remove it from the primary checkout (`git worktree remove --force ../zuban-<id>` and `git branch -D work/<id>`); otherwise say what it holds in the note. Once the jedi bead has landed, set this issue back to `open`; `agent-start.sh` deletes any leftover worktree for it when it is next claimed.
+
 ### 3. Landing the Plane (in the worktree)
 
 File beads for anything you noticed but didn't work on — related issues, edge cases, tangents. Do not pursue them.
@@ -73,7 +89,7 @@ If the new bead requires changes to the **core zuban codebase** (server-side ren
 bd update <id> --status deferred
 ```
 
-Core zuban work is out of scope for this project until prioritized separately. Only test harness, adapter (`lsp_compat.py`), and fixture/script work is in scope.
+Core zuban work is out of scope for this project until prioritized separately. Only test harness, adapter (`lsp_compat.py`), and fixture/script work is in scope — and apart from `scripts/run_jedi_rename_tests.sh`, those files live in jedi (see [Changes in jedi](#changes-in-jedi)).
 
 Then run the landing script:
 
@@ -93,7 +109,7 @@ A conflict in `.beads/issues.jsonl` is resolved automatically by exporting again
 
 ### 4. **MANDATORY: Reflect on Workflow**
 
-Before stopping, review the session for friction, gaps, or follow-up work. This step is **not optional** — do not skip it.
+Review the session for friction, gaps, or follow-up work. This step is **not optional** — do not skip it. `agent-land.sh` removes your worktree, so reflect on startup and work *before* running it, and on the landing itself afterwards.
 
 **For every issue you encountered or discovered (permission errors, missing steps, unclear instructions, new edge cases):**
 
@@ -103,11 +119,11 @@ Fix in-place (only when the fix is clear and unambiguous):
 - **If a new category of obstacle appeared:** add it to the script's guard logic.
 - **If any step is currently prose instructions:** convert it to scripted commands.
 
-Make these fixes in your worktree and land them like any other change; the next `agent-start.sh` fast-forwards them into the primary checkout.
+Commit these fixes in your worktree before running `agent-land.sh`, so they land with your change; the next `agent-start.sh` fast-forwards them into the primary checkout. Anything found during landing has no worktree to fix it in — file a bead for it.
 
 File a bead for anything requiring deeper investigation or design:
 1. **File a bead** — `bd create --title="..." --description="..." --type=task --priority=<n>`
-2. **Push any new beads** — run `bd export > .beads/issues.jsonl`, commit, and push to `jedi-compare`.
+2. **Push any new beads** — beads filed before `agent-land.sh` are exported and pushed by it. After landing, run `bd dolt push` in the primary checkout (it pushes only the database; `.beads/issues.jsonl` catches up at the next landing).
 
 **If workflow was smooth with no issues:** write one sentence saying so — no bead needed.
 

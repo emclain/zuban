@@ -66,7 +66,8 @@ cargo build
 cargo test
 
 # Run jedi rename fixture tests against zuban
-# (sets ZUBAN_TYPESHED automatically; requires ../jedi to be checked out)
+# (sets ZUBAN_TYPESHED automatically; requires ../jedi to be checked out. ../jedi is
+# read-only for zuban agents — see "Changes in jedi" in MULTI_AGENT.md)
 bash scripts/run_jedi_rename_tests.sh
 ```
 
