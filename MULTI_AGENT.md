@@ -102,7 +102,7 @@ bash scripts/agent-land.sh
 What it does, in order:
 
 1. Runs `cargo test` with a per-worktree target directory.
-2. Merges `origin/jedi-compare` and pushes `work/<id>:jedi-compare`, retrying on rejection. The issue stays `in_progress` until the code is on origin.
+2. Merges `origin/jedi-compare` and pushes `work/<id>:jedi-compare`, retrying when another instance landed first; a push that fails for any other reason stops the script. The issue stays `in_progress` until the code is on origin.
 3. Closes the issue.
 4. Commits a fresh `bd export` to `.beads/issues.jsonl` and pushes it, retrying the same way; then runs `bd dolt push`.
 5. Removes the worktree and its branch.

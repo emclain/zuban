@@ -85,6 +85,31 @@ commit_export() {
   fi
 }
 
+# Push $branch to jedi-compare. `git push` exits 1 both when another instance
+# landed first and when the push can't happen at all (auth, network, a hook),
+# so a failure is retried only if origin/jedi-compare has moved since we last
+# saw it. Any arguments run as a command after each merge.
+push_branch() {
+  local attempt seen
+  for attempt in 1 2 3 4 5 6 7 8 9 10; do
+    seen="$(git rev-parse origin/jedi-compare)"
+    if git push origin "$branch:jedi-compare"; then
+      return 0
+    fi
+    git fetch origin jedi-compare
+    if [ "$(git rev-parse origin/jedi-compare)" = "$seen" ]; then
+      echo "ERROR: push failed" >&2
+      exit 1
+    fi
+    echo "Push rejected — another instance landed first, retrying..."
+    sleep 1
+    merge_origin
+    "$@"
+  done
+  echo "ERROR: push still rejected after $attempt attempts." >&2
+  exit 1
+}
+
 # ── 1. Quality gates ─────────────────────────────────────────────────────────
 echo "=== Quality gates ==="
 # Isolate build artifacts to this worktree to avoid cross-instance file-lock conflicts.
@@ -101,11 +126,7 @@ cargo test
 # stops on a conflict never leaves a closed issue behind.
 echo "=== Pushing code ==="
 merge_origin
-until git push origin "$branch:jedi-compare"; do
-  echo "Push rejected — another instance landed first, retrying..."
-  sleep 1
-  merge_origin
-done
+push_branch
 
 # ── 3. Close the issue ───────────────────────────────────────────────────────
 if [ -n "$claimed" ]; then
@@ -118,12 +139,7 @@ fi
 # for git, and bd dolt push for the Dolt history that `bd bootstrap` restores.
 echo "=== Persisting beads state ==="
 commit_export
-until git push origin "$branch:jedi-compare"; do
-  echo "Push rejected — retrying..."
-  sleep 1
-  merge_origin
-  commit_export
-done
+push_branch commit_export
 
 dolt_pushed=0
 for attempt in 1 2 3; do
