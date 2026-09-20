@@ -917,7 +917,7 @@ impl<'db: 'slf, 'slf> Inferred {
                         Specific::Function => {
                             let func = prepare_func(i_s, *definition, attribute_class);
                             let attr_kind = AttributeKind::DefMethod { is_final: false };
-                            if !func.node().params().iter().next().is_some_and(|p| {
+                            if !func.as_node().params().iter().next().is_some_and(|p| {
                                 matches!(
                                     p.kind(),
                                     ParamKind::PositionalOnly
@@ -3233,11 +3233,11 @@ pub fn add_attribute_error(
         let bound = bound.format_short(i_s.db);
         let type_var_name = usage.type_var.name(i_s.db);
         node_ref.add_issue(
-                    i_s,
-                    IssueKind::UnionAttributeErrorOfUpperBound(format!(
-                        r#"Item {object} of the upper bound "{bound}" of type variable "{type_var_name}" has no attribute "{name}""#
-                    ).into())
-                );
+            i_s,
+            IssueKind::UnionAttributeErrorOfUpperBound(format!(
+                r#"Item {object} of the upper bound "{bound}" of type variable "{type_var_name}" has no attribute "{name}""#
+            ).into())
+        );
         return;
     }
     node_ref.add_issue(

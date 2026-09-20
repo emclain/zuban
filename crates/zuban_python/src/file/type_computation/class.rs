@@ -30,7 +30,7 @@ use crate::{
         },
     },
     inference_state::InferenceState,
-    node_ref::NodeRef,
+    node_ref::{KnownNodeRef, NodeRef},
     python_state::{NAME_TO_CLASS_DIFF, NAME_TO_FUNCTION_DIFF},
     type_::{
         AnyCause, CallableContent, CallableParam, CallableParams, ClassGenerics, Dataclass,
@@ -86,51 +86,40 @@ const NAMEDTUPLE_PROHIBITED_NAMES: [&str; 12] = [
     "__annotations__",
 ];
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub(crate) struct ClassNodeRef<'file>(NodeRef<'file>);
+pub type ClassNodeRef<'x> = KnownNodeRef<'x, ClassDef<'x>>;
 
 impl<'db: 'file, 'file> ClassNodeRef<'file> {
-    #[inline]
-    pub fn new(file: &'file PythonFile, node_index: NodeIndex) -> Self {
-        Self::from_node_ref(NodeRef::new(file, node_index))
-    }
-
     #[inline]
     pub fn from_link(db: &'file Database, link: PointLink) -> Self {
         Self::from_node_ref(NodeRef::from_link(db, link))
     }
 
     #[inline]
-    pub fn from_node_ref(node_ref: NodeRef<'file>) -> Self {
-        debug_assert!(node_ref.maybe_class().is_some(), "{node_ref:?}");
-        Self(node_ref)
+    pub fn from_node_index(file: &'file PythonFile, node_index: NodeIndex) -> Self {
+        Self::from_node_ref(NodeRef::new(file, node_index))
     }
 
     pub fn into_node_ref(self) -> NodeRef<'file> {
-        self.into()
+        *self
     }
 
     #[inline]
-    pub fn to_db_lifetime(self, db: &Database) -> ClassNodeRef<'_> {
-        ClassNodeRef(self.0.to_db_lifetime(db))
-    }
-
-    pub fn node(&self) -> ClassDef<'file> {
-        ClassDef::by_index(&self.0.file.tree, self.0.node_index)
+    pub fn to_db_lifetime(self, db: &'db Database) -> ClassNodeRef<'db> {
+        ClassNodeRef::from_node_ref((&*self).to_db_lifetime(db))
     }
 
     pub fn name(&self) -> &'file str {
-        self.node().name().as_str()
+        self.as_node().name().as_str()
     }
 
     pub fn name_string_slice(&self) -> StringSlice {
-        let name = self.node().name();
-        StringSlice::new(self.0.file_index(), name.start(), name.end())
+        let name = self.as_node().name();
+        StringSlice::new(self.file_index(), name.start(), name.end())
     }
 
     #[inline]
     fn class_info_node_ref(&self) -> NodeRef<'file> {
-        self.0.add_to_node_index(CLASS_TO_CLASS_INFO_DIFFERENCE)
+        self.add_to_node_index(CLASS_TO_CLASS_INFO_DIFFERENCE)
     }
 
     pub fn incomplete_mro(&self, db: &Database) -> bool {
@@ -158,12 +147,12 @@ impl<'db: 'file, 'file> ClassNodeRef<'file> {
     }
 
     pub(crate) fn add_issue_on_name(&self, db: &Database, kind: IssueKind) -> bool {
-        NodeRef::new(self.file, self.node().index()).add_type_issue(db, kind)
+        NodeRef::new(self.file, self.as_node().index()).add_type_issue(db, kind)
     }
 
     #[inline]
     fn type_vars_node_ref(&self) -> NodeRef<'file> {
-        self.0.add_to_node_index(CLASS_TO_TYPE_VARS_DIFFERENCE)
+        self.add_to_node_index(CLASS_TO_TYPE_VARS_DIFFERENCE)
     }
 
     pub fn type_vars(&self, i_s: &InferenceState<'db, '_>) -> &'file TypeVarLikes {
@@ -172,7 +161,7 @@ impl<'db: 'file, 'file> ClassNodeRef<'file> {
         if point.calculated() {
             return TypeVarLikes::load_saved_type_vars(i_s.db, node_ref);
         }
-        let node = self.node();
+        let node = self.as_node();
         let type_var_likes = if let Some(type_params) = node.type_params() {
             self.file
                 .name_resolution_for_types(i_s)
@@ -220,7 +209,7 @@ impl<'db: 'file, 'file> ClassNodeRef<'file> {
     }
 
     pub fn class_link_in_mro(&self, db: &Database, link: PointLink) -> bool {
-        if self.0.as_link() == link || link == db.python_state.object_link() {
+        if self.as_link() == link || link == db.python_state.object_link() {
             return true;
         }
         let class_infos = self.use_cached_class_infos(db);
@@ -233,7 +222,7 @@ impl<'db: 'file, 'file> ClassNodeRef<'file> {
     }
 
     pub fn maybe_typed_dict_definition(&self) -> Option<&TypedDictDefinition> {
-        NodeRef::new(self.file, self.node().name_def().index())
+        NodeRef::new(self.file, self.as_node().name_def().index())
             .maybe_complex()
             .and_then(|c| match c {
                 ComplexPoint::TypedDictDefinition(tdd) => Some(tdd),
@@ -258,7 +247,7 @@ impl<'db: 'file, 'file> ClassNodeRef<'file> {
 
     pub fn infer_variance_of_type_params(self, db: &Database, check_narrowed: bool) {
         // To avoid recursions, we add calculating to the : node on class.
-        let colon_ref = NodeRef::new(self.file, self.node().block().index() - 1);
+        let colon_ref = NodeRef::new(self.file, self.as_node().block().index() - 1);
         let point = colon_ref.point();
         if point.calculating() || point.calculated() {
             return;
@@ -321,7 +310,7 @@ impl<'db: 'file, 'file> ClassNodeRef<'file> {
         }
     }
     pub fn add_issue_on_args(&self, i_s: &InferenceState, issue: IssueKind) -> bool {
-        let range = self.node().closing_and_opening_parentheses().unwrap();
+        let range = self.as_node().closing_and_opening_parentheses().unwrap();
         self.file.add_issue(
             i_s,
             Issue::from_start_stop(range.start, range.end, issue, false),
@@ -329,23 +318,9 @@ impl<'db: 'file, 'file> ClassNodeRef<'file> {
     }
 }
 
-impl<'a> std::ops::Deref for ClassNodeRef<'a> {
-    type Target = NodeRef<'a>;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-impl std::cmp::PartialEq<NodeRef<'_>> for ClassNodeRef<'_> {
-    fn eq(&self, other: &NodeRef) -> bool {
-        self.0 == *other
-    }
-}
-
 impl<'a> From<ClassNodeRef<'a>> for NodeRef<'a> {
     fn from(value: ClassNodeRef<'a>) -> Self {
-        value.0
+        *value
     }
 }
 
@@ -382,7 +357,7 @@ impl<'db: 'a, 'a> ClassInitializer<'a> {
     pub fn qualified_name(&self, db: &Database) -> String {
         self.class_storage
             .parent_scope
-            .qualified_name(db, self.node_ref.0, self.name())
+            .qualified_name(db, *self.node_ref, self.name())
     }
 
     pub(crate) fn maybe_type_var_like_in_parent(
@@ -393,8 +368,10 @@ impl<'db: 'a, 'a> ClassInitializer<'a> {
         match self.class_storage.parent_scope {
             ParentScope::Module => None,
             ParentScope::Class(node_index) => {
-                let parent_class =
-                    Self::from_node_ref(ClassNodeRef::new(self.node_ref.file, node_index));
+                let parent_class = Self::from_node_ref(ClassNodeRef::from_node_index(
+                    self.node_ref.file,
+                    node_index,
+                ));
                 parent_class.find_type_var_like_including_ancestors(db, type_var, true)
             }
             ParentScope::Function(node_index) => {
@@ -470,7 +447,7 @@ impl<'db: 'a, 'a> ClassInitializer<'a> {
     fn insert_class_infos(&self, i_s: &InferenceState) {
         let node_ref = self.node_ref.class_info_node_ref();
         debug_assert!(
-            NodeRef::new(node_ref.file, self.node().name_def().index())
+            NodeRef::new(node_ref.file, self.as_node().name_def().index())
                 .point()
                 .calculated()
         );
@@ -487,7 +464,7 @@ impl<'db: 'a, 'a> ClassInitializer<'a> {
         let mut is_disjoint_base = None;
         let mut dataclass_transform = None;
         let mut deprecated_reason = None;
-        if let Some(decorated) = self.node().maybe_decorated() {
+        if let Some(decorated) = self.as_node().maybe_decorated() {
             let name_resolution = self.node_ref.file.name_resolution_for_types(i_s);
             let mut dataclass_options = None;
             for decorator in decorated.decorators().iter() {
@@ -581,7 +558,7 @@ impl<'db: 'a, 'a> ClassInitializer<'a> {
                 ClassKind::Tuple => Some("A Tuple"),
                 ClassKind::NamedTuple => Some("A NamedTuple"),
             } {
-                NodeRef::new(self.node_ref.file, self.node().name_def().index())
+                NodeRef::new(self.node_ref.file, self.as_node().name_def().index())
                     .add_type_issue(db, IssueKind::DataclassCannotBe { kind: was.into() });
             }
             class_infos.kind = ClassKind::Normal;
@@ -591,7 +568,7 @@ impl<'db: 'a, 'a> ClassInitializer<'a> {
         }
         if total_ordering && !self.has_a_total_ordering_method_in_mro(db, &class_infos.mro) {
             // If there is no corresponding method, we just ignore the MRO
-            NodeRef::new(self.node_ref.file, self.node().name_def().index())
+            NodeRef::new(self.node_ref.file, self.as_node().name_def().index())
                 .add_type_issue(db, IssueKind::TotalOrderingMissingMethod);
             total_ordering = false;
         }
@@ -657,7 +634,7 @@ impl<'db: 'a, 'a> ClassInitializer<'a> {
             let _ = class_infos
                 .undefined_generics_type
                 .set(Arc::new(Type::TypedDict(td.clone())));
-            NodeRef::new(self.node_ref.file, self.node().name_def().index()).insert_complex(
+            NodeRef::new(self.node_ref.file, self.as_node().name_def().index()).insert_complex(
                 ComplexPoint::TypedDictDefinition(TypedDictDefinition::new(
                     td.clone(),
                     typed_dict_options.clone(),
@@ -809,7 +786,7 @@ impl<'db: 'a, 'a> ClassInitializer<'a> {
             if set_frozen_state_unknown {
                 options.frozen = None;
             }
-            if let Some(args) = self.node().arguments() {
+            if let Some(args) = self.as_node().arguments() {
                 for arg in args.iter() {
                     if let Argument::Keyword(kw) = arg {
                         options.assign_keyword_arg_to_dataclass_options(db, self.node_ref.file, kw);
@@ -827,9 +804,9 @@ impl<'db: 'a, 'a> ClassInitializer<'a> {
                 // Errors are ignored for now, whatever was first takes precedence.
                 .ok();
         };
-        let arguments = self.node().arguments();
+        let arguments = self.as_node().arguments();
         if let Some(arguments) = arguments {
-            let has_type_params = self.node().type_params().is_some();
+            let has_type_params = self.as_node().type_params().is_some();
             // Check metaclass before checking all the arguments, because it has a preference over
             // the metaclasses of the subclasses.
             #[allow(clippy::mutable_key_type)]
@@ -1486,7 +1463,7 @@ impl<'db: 'a, 'a> ClassInitializer<'a> {
                     } = name_resolution.resolve_name_without_narrowing(n)
                     && points_to.file.file_index == self.file.file_index
                 {
-                    let class_node = self.node();
+                    let class_node = self.as_node();
                     if points_to.node_index > class_node.index()
                         && points_to.node_index <= class_node.block().last_leaf_index()
                     {
@@ -1526,7 +1503,12 @@ impl<'db: 'a, 'a> ClassInitializer<'a> {
         let file = self.node_ref.file;
         let cls = Class::with_undefined_generics(self.node_ref);
         let i_s = &InferenceState::new(db, file).with_class_context(&cls);
-        find_stmt_named_tuple_types(i_s, file, &mut vec, self.node().block().iter_stmt_likes());
+        find_stmt_named_tuple_types(
+            i_s,
+            file,
+            &mut vec,
+            self.as_node().block().iter_stmt_likes(),
+        );
         for (name, index) in self.class_storage.class_symbol_table.iter() {
             if NAMEDTUPLE_PROHIBITED_NAMES.contains(&name) {
                 NodeRef::new(self.node_ref.file, *index).add_type_issue(
@@ -1731,7 +1713,7 @@ fn initialize_typed_dict_members(db: &Database, cls: &Class, td_infos: DeferredT
     let typed_dict_definition = cls.maybe_typed_dict_definition().unwrap();
     let mut typed_dict_members = TypedDictMemberGatherer::default();
     let mut extra_items = None;
-    let args = cls.node().arguments();
+    let args = cls.as_node().arguments();
     if let Some(args) = args {
         for (i, base) in cls
             .use_cached_class_infos(db)
@@ -1772,7 +1754,7 @@ fn initialize_typed_dict_members(db: &Database, cls: &Class, td_infos: DeferredT
         i_s,
         file,
         &mut typed_dict_members,
-        cls.node().block().iter_stmt_likes(),
+        cls.as_node().block().iter_stmt_likes(),
         &typed_dict_definition.initialization_args,
         extra_items.as_ref(),
     );
@@ -2323,7 +2305,7 @@ fn maybe_dataclass_transform_func(
     db: &Database,
     func: FuncNodeRef,
 ) -> Option<DataclassTransformObj> {
-    let decorated = func.node().maybe_decorated()?;
+    let decorated = func.as_node().maybe_decorated()?;
     {
         let func_point = func.point();
         if func_point.calculating() {

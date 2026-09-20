@@ -31,17 +31,19 @@ pub(crate) fn maybe_infer_pytest_param(
         db,
         func.file,
         param,
-        func.node().name_def(),
+        func.as_node().name_def(),
         func_node.maybe_decorated().map(|dec| dec.decorators()),
     )?;
 
     let i_s = &InferenceState::new(db, func.file);
     let mut t = func.inferred_return_type(i_s);
     debug!("Executed pytest fixture: {}", t.format_short(db));
-    if let Type::Class(c) = t.as_ref()
-        && db.python_state.is_generator(c.link)
-    {
-        t = Cow::Owned(c.class(db).nth_type_argument(db, 0));
+    if let Type::Class(c) = t.as_ref() {
+        if db.python_state.is_generator(c.link) || db.python_state.is_async_generator(c.link) {
+            t = Cow::Owned(c.class(db).nth_type_argument(db, 0));
+        } else if db.python_state.is_coroutine(c.link) {
+            t = Cow::Owned(c.class(db).nth_type_argument(db, 2));
+        }
     }
     Some(Inferred::from_type(t.into_owned()))
 }
@@ -97,7 +99,9 @@ fn is_pytest_fixture_or_test(
                 ParentScope::Function(_) => false,
                 ParentScope::Class(c) => {
                     matches!(
-                        ClassNodeRef::new(file, c).class_storage().parent_scope,
+                        ClassNodeRef::from_node_index(file, c)
+                            .class_storage()
+                            .parent_scope,
                         ParentScope::Module
                     )
                 }

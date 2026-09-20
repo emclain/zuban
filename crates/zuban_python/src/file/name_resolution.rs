@@ -20,7 +20,7 @@ use crate::{
     node_ref::NodeRef,
     recoverable_error,
     type_::LookupResult,
-    utils::is_magic_method,
+    utils::{SymbolTable, is_magic_method},
 };
 
 use super::{ClassInitializer, PythonFile, python_file::StarImport};
@@ -201,13 +201,25 @@ impl<'db, 'file, 'i_s> NameResolution<'db, 'file, 'i_s> {
                             } else {
                                 import_name.index()
                             };
-                            self.add_issue(
-                                index,
-                                IssueKind::ImportAttributeError {
-                                    module_name: Box::from(imp.qualified_name(self.i_s.db)),
-                                    name: Box::from(import_name.as_str()),
-                                },
-                            );
+                            let qualified = imp.qualified_name(self.i_s.db);
+                            let full = format!("{qualified}.{}", import_name.as_str());
+                            if self
+                                .i_s
+                                .db
+                                .project
+                                .ignored_imports()
+                                .ignores_qualified_name(&full)
+                            {
+                                debug!("Ignored module import from {full:?} because of config");
+                            } else {
+                                self.add_issue(
+                                    index,
+                                    IssueKind::ImportAttributeError {
+                                        module_name: qualified.into(),
+                                        name: Box::from(import_name.as_str()),
+                                    },
+                                );
+                            }
                         }
                     }
                 };
@@ -843,9 +855,6 @@ impl<'db, 'file, 'i_s> NameResolution<'db, 'file, 'i_s> {
             super_file
                 .file_entry(self.i_s.db)
                 .add_invalidation(self.file.file_index());
-            if let Some(name_ref) = super_file.lookup_symbol(name) {
-                return Ok(StarImportResult::Link(name_ref.as_link()));
-            }
 
             let lookup_type_params = |file: &PythonFile, type_params: Option<TypeParams>| {
                 let found = type_params?
@@ -857,30 +866,47 @@ impl<'db, 'file, 'i_s> NameResolution<'db, 'file, 'i_s> {
                 )));
             };
 
+            let lookup_symbol_table = |file: &PythonFile, symbol_table: &SymbolTable| {
+                let found = symbol_table.lookup_symbol(name)?;
+                if self.stop_on_assignments
+                    && let Some(name) = NodeRef::new(file, found).maybe_name()
+                    && let Some(assignment) = name.maybe_assignment_definition_name()
+                    && assignment.is_annotated_without_assignment()
+                {
+                    return None;
+                }
+                Some(StarImportResult::Link(PointLink::new(
+                    file.file_index(),
+                    found,
+                )))
+            };
+
             if let Some(func) = self.i_s.current_function() {
                 debug!("TODO lookup in func of sub file");
                 // TODO in theory we need to lookup all type params in all parents, but I'm not
                 // sure this is helpful, since this should ideally be done by the name binder. The
                 // name binder however does currently not support multi-file analysis and this is
                 // an architectural issue.
-                if let Some(ok) = lookup_type_params(func.file, func.node().type_params()) {
+                if let Some(ok) = lookup_type_params(func.file, func.as_node().type_params()) {
                     return Ok(ok);
                 }
                 if let Some(class) = func.class
-                    && let Some(ok) = lookup_type_params(class.file, class.node().type_params())
+                    && let Some(ok) = lookup_type_params(class.file, class.as_node().type_params())
                 {
                     return Ok(ok);
                 }
             } else if let Some(class) = self.i_s.current_class() {
-                if let Some(index) = class.class_storage.class_symbol_table.lookup_symbol(name) {
-                    return Ok(StarImportResult::Link(PointLink::new(
-                        class.node_ref.file_index(),
-                        index,
-                    )));
+                if let Some(result) =
+                    lookup_symbol_table(class.file, &class.class_storage.class_symbol_table)
+                {
+                    return Ok(result);
                 }
-                if let Some(ok) = lookup_type_params(class.file, class.node().type_params()) {
+                if let Some(ok) = lookup_type_params(class.file, class.as_node().type_params()) {
                     return Ok(ok);
                 }
+            }
+            if let Some(result) = lookup_symbol_table(super_file, &super_file.symbol_table) {
+                return Ok(result);
             }
             self.with_new_file(super_file)
                 .lookup_from_star_import_with_node_index(name, false, None, star_imports_seen)

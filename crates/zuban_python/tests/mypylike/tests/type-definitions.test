@@ -179,7 +179,8 @@ def foo(
         z: (a := int),  # E: Invalid type comment or annotation
         ): ...
 
-[case func_in_class_should_not_be_looked_at_as_a_type_definition]
+[case func_in_class_should_not_be_looked_at_as_a_type_definition_mypy_compatible]
+# flags: --mode mypy
 bar = int
 class Foo:
     x: foo  # E: Name "foo" is not defined
@@ -188,8 +189,20 @@ class Foo:
     def foo(self) -> None: ...
     def bar(self) -> None: ...
 
+[case func_in_class_should_not_be_looked_at_as_a_type_definition_not_mypy_compatible]
+# flags: --mode default
+bar = int
+class Foo:
+    x: foo  # E: Function "__main__.Foo.foo" is not valid as a type \
+            # N: Perhaps you need "Callable[...]" or a callback protocol?
+    y: bar  # E: Function "__main__.Foo.bar" is not valid as a type \
+            # N: Perhaps you need "Callable[...]" or a callback protocol?
+
+    def foo(self) -> None: ...
+    def bar(self) -> None: ...
+
 reveal_type(Foo().x)  # N: Revealed type is "Any"
-reveal_type(Foo().y)  # N: Revealed type is "int"
+reveal_type(Foo().y)  # N: Revealed type is "Any"
 
 [case invalid_module_getattr]
 from ok import undefined1
@@ -393,7 +406,7 @@ from typing import TypeAlias
 X = int | str # type: TypeAlias  # E: TypeAlias comment currently not supported
 Y: TypeAlias = int | str
 Z: TypeAlias  # E: Right side needed for TypeAlias
-def f(x: X, y: Y, z: Z):
+def f(x: X, y: Y, z: Z):  # E: Name "Z" is not defined
     reveal_type(x)  # N: Revealed type is "Any"
     reveal_type(y)  # N: Revealed type is "int | str"
     reveal_type(z)  # N: Revealed type is "Any"

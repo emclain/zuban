@@ -38,7 +38,7 @@ impl PythonFile {
             // Check for ignore_missing_imports in mypy.ini/pyproject.toml overrides
             && !db
                 .project
-                .ignored_global_imports().contains(name_str)
+                .ignored_imports().ignores_exact_import(name_str)
         {
             NodeRef::new(self, name.index()).add_type_issue(
                 db,
@@ -108,15 +108,25 @@ impl PythonFile {
                     name.as_str()
                 );
             } else if !self.flags(db).ignore_missing_imports {
-                let module_name = if let Some(base_loaded) = base.ensured_loaded_file(db) {
-                    format!("{}.{}", base_loaded.qualified_name(db), name.as_str()).into()
+                let module_name: Box<str> =
+                    if let Some(base_loaded) = base.clone().ensured_loaded_file(db) {
+                        format!("{}.{}", base_loaded.qualified_name(db), name.as_str()).into()
+                    } else {
+                        // TODO this is not correct and weird, but it's probably pretty rare that a
+                        // file is deleted but still in the virtual filesystem.
+                        dotted.as_code().into()
+                    };
+
+                if db
+                    .project
+                    .ignored_imports()
+                    .ignores_qualified_name(&module_name)
+                {
+                    debug!("Ignored a missing import {module_name:?} due to config file");
                 } else {
-                    // TODO this is not correct and weird, but it's probably pretty rare that a
-                    // file is deleted but still in the virtual filesystem.
-                    dotted.as_code().into()
-                };
-                NodeRef::new(self, name.index())
-                    .add_type_issue(db, IssueKind::ModuleNotFound { module_name });
+                    NodeRef::new(self, name.index())
+                        .add_type_issue(db, IssueKind::ModuleNotFound { module_name });
+                }
             }
             result
         };

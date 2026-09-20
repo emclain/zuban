@@ -50,7 +50,7 @@ impl<'project> Document<'project> {
                             i_s.db,
                             cls.file,
                             cls.class_storage.parent_scope,
-                            cls.node().name(),
+                            cls.as_node().name(),
                         )
                         .documentation();
                         if !doc.is_empty() {
@@ -60,7 +60,7 @@ impl<'project> Document<'project> {
                         result
                     } else {
                         recoverable_error!(
-                            "There should to be a current class for Self documentation"
+                            "There should be a current class for Self documentation"
                         );
                         "".into()
                     }

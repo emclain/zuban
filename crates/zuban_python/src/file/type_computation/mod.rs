@@ -115,7 +115,7 @@ pub(super) enum InvalidVariableType<'a> {
     Other,
     Slice,
     InlineTypedDict,
-    NameError { name: &'a str },
+    CyclicDefinition { name: &'a str },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -158,9 +158,8 @@ impl InvalidVariableType<'_> {
                     ),
                 }
             }
-            Self::NameError { name } => IssueKind::NameError {
+            Self::CyclicDefinition { name } => IssueKind::CyclicDefinition {
                 name: (*name).into(),
-                note: None,
             },
             Self::Function { node_ref } => IssueKind::InvalidType {
                 message: format!(
@@ -388,45 +387,61 @@ impl<'db: 'x + 'file, 'file, 'i_s, 'c, 'x> TypeComputation<'db, 'file, 'i_s, 'c>
         }
     }
 
-    fn compute_forward_reference(
+    fn compute_string_annotation(
         &mut self,
         start: CodeIndex,
         code: Cow<str>,
     ) -> TypeContent<'db, 'db> {
         let f = self
             .file
-            .ensure_forward_reference_file(self.i_s.db, start, code);
+            .ensure_string_annotation_file(self.i_s.db, start, code);
 
         // Does some light name binding to avoid cases where we cannot find names otherwise.
         {
-            let node_ref = NodeRef::from_link(self.name_resolution.i_s.db, self.for_definition);
-
-            let redirect_type_params = |type_params: Option<TypeParams>| {
-                if let Some(type_params) = type_params {
-                    for name in f.tree.filter_all_names(None) {
-                        let name_str = name.as_code();
-                        if let Some(matched) = type_params
-                            .iter()
-                            .find(|type_param| type_param.name_def().as_code() == name_str)
-                        {
-                            f.points.set(
-                                name.index(),
-                                Point::new_redirect(
-                                    self.file.file_index,
-                                    matched.name_def().name_index(),
-                                    Locality::NameBinder,
-                                ),
-                            );
+            fn check(origin_node_ref: NodeRef, annotation_file: &PythonFile) {
+                let redirect_type_params = |type_params: Option<TypeParams>| {
+                    if let Some(type_params) = type_params {
+                        for name in annotation_file.tree.filter_all_names(None) {
+                            let name_str = name.as_code();
+                            if let Some(matched) = type_params
+                                .iter()
+                                .find(|type_param| type_param.name_def().as_code() == name_str)
+                            {
+                                annotation_file.points.set(
+                                    name.index(),
+                                    Point::new_redirect(
+                                        origin_node_ref.file_index(),
+                                        matched.name_def().name_index(),
+                                        Locality::NameBinder,
+                                    ),
+                                );
+                            }
                         }
                     }
+                };
+                let parent = if let Some(func) = origin_node_ref.maybe_function() {
+                    redirect_type_params(func.type_params());
+                    FuncNodeRef::new(origin_node_ref.file, func).parent_scope()
+                } else if let Some(class) = origin_node_ref.maybe_class() {
+                    redirect_type_params(class.type_params());
+                    ClassNodeRef::new(origin_node_ref.file, class)
+                        .class_storage()
+                        .parent_scope
+                } else {
+                    return;
+                };
+                match parent {
+                    ParentScope::Function(f) => {
+                        check(NodeRef::new(origin_node_ref.file, f), annotation_file)
+                    }
+                    ParentScope::Class(c) => {
+                        check(NodeRef::new(origin_node_ref.file, c), annotation_file)
+                    }
+                    ParentScope::Module => (),
                 }
-            };
-            if let Some(func) = node_ref.maybe_function() {
-                redirect_type_params(func.type_params())
             }
-            if let Some(class) = node_ref.maybe_class() {
-                redirect_type_params(class.type_params())
-            }
+            let node_ref = NodeRef::from_link(self.name_resolution.i_s.db, self.for_definition);
+            check(node_ref, f)
         }
 
         if let Some(star_exprs) = f.tree.maybe_star_expressions() {
@@ -3163,8 +3178,8 @@ impl<'db: 'x + 'file, 'file, 'i_s, 'c, 'x> TypeComputation<'db, 'file, 'i_s, 'c>
         match atom.unpack() {
             AtomContent::Name(n) => self.compute_type_name(n),
             AtomContent::Strings(s_o_b) => match s_o_b.as_python_string() {
-                PythonString::Ref(start, s) => self.compute_forward_reference(start, s.into()),
-                PythonString::String(start, s) => self.compute_forward_reference(start, s.into()),
+                PythonString::Ref(start, s) => self.compute_string_annotation(start, s.into()),
+                PythonString::String(start, s) => self.compute_string_annotation(start, s.into()),
                 PythonString::FString => TypeContent::InvalidVariable(InvalidVariableType::Other),
             },
             AtomContent::NoneLiteral => TypeContent::Type(Type::None),
@@ -3533,7 +3548,7 @@ impl<'db, 'file> NameResolution<'db, 'file, '_> {
         if let Some(specific) = node_ref
             .file
             .points
-            .get(func.node().name_def().index())
+            .get(func.as_node().name_def().index())
             .maybe_calculated_and_specific()
             && let Some(tc) = check_special_case(specific)
         {
@@ -3619,7 +3634,7 @@ impl<'db, 'file> NameResolution<'db, 'file, '_> {
                 // If a module contains a __getattr__, the type can be part of that
                 // (which is typically just an Any that propagates).
                 if let Some(func) = name_node_ref.maybe_name_of_function() {
-                    let func_node_ref = FuncNodeRef::new(name_node_ref.file, func.index());
+                    let func_node_ref = FuncNodeRef::new(name_node_ref.file, func);
                     // The inference state context is new, because we are in a new module.
                     let i_s = &InferenceState::new(self.i_s.db, name_node_ref.file);
                     func_node_ref.ensure_cached_type_vars(i_s, None);
@@ -3640,7 +3655,7 @@ impl<'db, 'file> NameResolution<'db, 'file, '_> {
         match name_def.expect_type() {
             TypeLike::ClassDef(c) => {
                 cache_class_name(node_ref, c);
-                Self::ensure_cached_class(i_s, ClassNodeRef::new(node_ref.file, c.index()))
+                Self::ensure_cached_class(i_s, ClassNodeRef::new(node_ref.file, c))
             }
             TypeLike::Assignment(assignment) => node_ref
                 .file
@@ -4559,16 +4574,16 @@ impl<'db, 'file> NameResolution<'db, 'file, '_> {
     ) -> Option<DecoratorState<'db>> {
         match self.lookup_decorator_if_only_names(decorator)? {
             Lookup::T(TypeContent::InvalidVariable(InvalidVariableType::Function { node_ref })) => {
-                let name_ref = NodeRef::new(node_ref.file, node_ref.node().name_def().index());
+                let name_ref = NodeRef::new(node_ref.file, node_ref.as_node().name_def().index());
                 if name_ref.point().calculating() {
                     return Some(DecoratorState::Calculating);
                 }
-                Function::new(node_ref.into(), None).cache_func_with_name_def(
+                Function::new(*node_ref, None).cache_func_with_name_def(
                     &InferenceState::new(self.i_s.db, node_ref.file),
                     name_ref,
                     false,
                 );
-                Some(DecoratorState::NodeRef(node_ref.into()))
+                Some(DecoratorState::NodeRef(*node_ref))
             }
             Lookup::T(TypeContent::Class { node_ref, .. }) => {
                 node_ref

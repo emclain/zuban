@@ -110,7 +110,8 @@ impl<'db, 'a> InferenceState<'db, 'a> {
                 Context::Function(&func)
             }
             ParentScope::Class(class_index) => {
-                class = Class::with_self_generics(db, ClassNodeRef::new(file, class_index));
+                class =
+                    Class::with_self_generics(db, ClassNodeRef::from_node_index(file, class_index));
                 Context::Class(&class)
             }
         };
@@ -264,7 +265,7 @@ impl<'db, 'a> InferenceState<'db, 'a> {
 
     pub fn in_untyped_context(&self) -> bool {
         self.current_function()
-            .is_some_and(|f| !f.node().is_typed())
+            .is_some_and(|f| !f.as_node().is_typed())
     }
 
     pub fn should_ignore_none_in_untyped_context(&self) -> bool {

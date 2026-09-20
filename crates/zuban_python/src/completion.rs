@@ -267,7 +267,7 @@ impl<'db, C: Fn(Range, &dyn Completion) -> Option<T>, T> CompletionResolver<'db,
             match scope {
                 Scope::Module => self.add_global_module_completions(file),
                 Scope::Class(cls) => {
-                    let storage = ClassNodeRef::new(file, cls.index()).class_storage();
+                    let storage = ClassNodeRef::new(file, cls).class_storage();
                     for (_, node_index) in storage.class_symbol_table.iter() {
                         self.maybe_add_tree_name(
                             file,
@@ -665,7 +665,7 @@ impl<'db, C: Fn(Range, &dyn Completion) -> Option<T>, T> CompletionResolver<'db,
     ) {
         let file = c.node_ref.to_db_lifetime(self.infos.db).file;
         let storage = c.node_ref.to_db_lifetime(self.infos.db).class_storage();
-        let class_node = c.node();
+        let class_node = c.as_node();
         let is_django_base = c.has_django_stubs_base_class(self.infos.db);
         for (symbol, node_index) in storage.class_symbol_table.iter() {
             if is_private(symbol) || should_ignore(symbol) {
@@ -847,8 +847,7 @@ fn find_kind_for_name_def(
         }
     } else if let Some(class) = name_def.maybe_name_of_class() {
         kind = CompletionItemKind::CLASS;
-        if let Some(class_infos) =
-            ClassNodeRef::new(file, class.index()).maybe_cached_class_infos(db)
+        if let Some(class_infos) = ClassNodeRef::new(file, class).maybe_cached_class_infos(db)
             && matches!(class_infos.kind, ClassKind::Enum)
         {
             kind = CompletionItemKind::ENUM
@@ -870,10 +869,8 @@ impl<'db> Iterator for ScopesIterator<'db> {
         let result = self.current.take()?;
         let mut parent_scope = |scope| match scope {
             Scope::Module => Ok(()),
-            Scope::Class(c) => Err(ClassNodeRef::new(self.file, c.index())
-                .class_storage()
-                .parent_scope),
-            Scope::Function(f) => Err(FuncNodeRef::new(self.file, f.index()).parent_scope()),
+            Scope::Class(c) => Err(ClassNodeRef::new(self.file, c).class_storage().parent_scope),
+            Scope::Function(f) => Err(FuncNodeRef::new(self.file, f).parent_scope()),
             Scope::Lambda(l) => {
                 self.current = Some(l.parent_scope());
                 Ok(())

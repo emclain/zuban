@@ -796,7 +796,7 @@ impl<'db: 'a, 'a> Class<'a> {
         bind: impl FnOnce(LookupResult, TypeOrClass<'a>, MroIndex) -> T,
     ) -> T {
         if name == "__doc__" {
-            let t = if self.node().docstring().is_some() {
+            let t = if self.as_node().docstring().is_some() {
                 i_s.db.python_state.str_type()
             } else {
                 Type::None
@@ -1701,7 +1701,7 @@ impl<'db: 'a, 'a> Class<'a> {
     }
 
     pub fn ensure_calculated_diagnostics_for_class(&self, db: &Database) -> Result<(), ()> {
-        let class_block = self.node().block();
+        let class_block = self.as_node().block();
         if !self
             .node_ref
             .file
@@ -1874,7 +1874,7 @@ impl<'db: 'a, 'a> Class<'a> {
                             && let Some(func) = name_def.maybe_parent_function_of_param()
                         {
                             let parent_scope =
-                                FuncNodeRef::new(redirected_to.file, func.index()).parent_scope();
+                                FuncNodeRef::new(redirected_to.file, func).parent_scope();
                             if !matches!(parent_scope, ParentScope::Class(c) if c == self.node_index)
                             {
                                 return None;

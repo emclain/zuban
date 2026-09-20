@@ -1,7 +1,10 @@
 use std::{
     collections::hash_map::Entry,
     path::Path,
-    sync::{Arc, Mutex, OnceLock},
+    sync::{
+        Arc, Mutex, OnceLock,
+        atomic::{AtomicUsize, Ordering},
+    },
 };
 
 use config::ProjectOptions;
@@ -28,10 +31,13 @@ use crate::{
     utils::is_file_with_python_ending,
 };
 
+const FILE_LOAD_LIMIT: usize = 2000;
+
 pub(crate) struct ImportFinder<'db> {
     db: &'db Database,
     name: &'db str,
     found: Mutex<Vec<PotentialImport<'db>>>,
+    files_loaded: AtomicUsize,
 }
 
 #[derive(Clone, Copy)]
@@ -60,14 +66,15 @@ impl<'db> ImportFinder<'db> {
             db,
             name,
             found: Default::default(),
+            files_loaded: Default::default(),
         };
         for workspace in db.vfs.workspaces.load().iter() {
             match &workspace.kind {
                 WorkspaceKind::TypeChecking => {
-                    slf.find_importable_name_in_entries(&workspace.entries, false, true)
+                    slf.find_importable_name_in_entries(&workspace.entries, false, true, 0)
                 }
                 WorkspaceKind::SitePackages => {
-                    slf.find_importable_name_in_entries(&workspace.entries, false, false)
+                    slf.find_importable_name_in_entries(&workspace.entries, false, false, 0)
                 }
                 WorkspaceKind::PythonStdLib => (), // Already added as part of typeshed
                 WorkspaceKind::Typeshed => {
@@ -99,6 +106,11 @@ impl<'db> ImportFinder<'db> {
                 WorkspaceKind::Fallback => (),
             };
         }
+        if slf.has_reached_limits() {
+            tracing::warn!(
+                "The auto-import limit of {FILE_LOAD_LIMIT} loaded files has been reached"
+            );
+        }
         slf.found.into_inner().unwrap()
     }
 
@@ -107,7 +119,11 @@ impl<'db> ImportFinder<'db> {
         entries: &Entries,
         in_package: bool,
         add_submodules: bool,
+        non_py_dir_depth: usize,
     ) {
+        if self.has_reached_limits() {
+            return;
+        }
         if in_package {
             if let Some(entry) = entries
                 .search("__init__.pyi")
@@ -138,27 +154,71 @@ impl<'db> ImportFinder<'db> {
                 _ => None,
             })
             .collect();
+        let mut is_different_project = false;
+        let has_python_files_in_dir = entries.iter().any(|e| match e {
+            DirectoryEntry::File(f) => {
+                if &*f.name == "pyproject.toml" {
+                    is_different_project = true;
+                }
+                f.name.ends_with(".py") || f.name.ends_with(".pyi")
+            }
+            /*
+             * Theoretically we would like to filter something like this, but it's currently
+             * impossible, because .git is not part of the workspace, it gets filtered out.
+            DirectoryEntry::Directory(dir) if &*dir.name == ".git" => {
+                is_different_project = true;
+                false
+            }
+            */
+            _ => false,
+        });
+        if is_different_project && in_package {
+            // We probably do not want to check a different project
+            return;
+        }
         entries.into_par_iter().for_each(|entry| match entry {
             DirectoryEntry::File(entry) => {
                 // Only find importable files like foo.py that have importable file endings and
                 // don't have symbols in there like dashes and spaces.
                 // TODO there are a lot of other symbols that are invalid
                 if is_file_with_python_ending(&entry.name)
-                    && !entry.name.contains(" ")
-                    && !entry.name.contains("-")
+                    && let Some(prefix) = Path::new(&*entry.name).file_prefix()
+                    && might_be_python_identifier(prefix.to_str().unwrap())
                 {
                     self.find_importable_name_in_file_entry(&entry, false);
                 }
             }
-            DirectoryEntry::Directory(dir) => self.find_importable_name_in_entries(
-                Directory::entries(&self.db.vfs, &dir),
-                true,
-                add_submodules,
-            ),
+            DirectoryEntry::Directory(dir) => {
+                if might_be_python_identifier(&dir.name) {
+                    // In cases where the project is equal to something like $HOME, which typically
+                    // contains millions of files (sometimes multiplied by symlinks), we need to
+                    // avoid following every directory. This also makes sense in a different way:
+                    // If people don't have Python files in the directories the dirs are probably
+                    // not something they want to import.
+                    const MAX_NON_PY_DIR_AUTO_IMPORTS: usize = 2;
+                    let new_non_py_dir_depth = if has_python_files_in_dir {
+                        0
+                    } else {
+                        non_py_dir_depth + 1
+                    };
+                    if new_non_py_dir_depth < MAX_NON_PY_DIR_AUTO_IMPORTS {
+                        self.find_importable_name_in_entries(
+                            Directory::entries(&self.db.vfs, &dir),
+                            true,
+                            add_submodules,
+                            new_non_py_dir_depth,
+                        )
+                    }
+                }
+            }
             _ => {
                 unreachable!("Removed above")
             }
         })
+    }
+
+    fn has_reached_limits(&self) -> bool {
+        self.files_loaded.load(Ordering::Relaxed) > FILE_LOAD_LIMIT
     }
 
     fn find_importable_name_in_file_entry(
@@ -166,6 +226,10 @@ impl<'db> ImportFinder<'db> {
         entry: &Arc<FileEntry>,
         add_star_imports: bool,
     ) -> bool {
+        if self.has_reached_limits() {
+            return false;
+        }
+        self.files_loaded.fetch_add(1, Ordering::SeqCst);
         let Some(file) = self.db.load_file_from_workspace(entry) else {
             return false;
         };
@@ -647,5 +711,34 @@ fn has_import_of_file(db: &Database, file: &PythonFile, dotted: DottedImportName
         }
     } else {
         false
+    }
+}
+
+fn might_be_python_identifier(s: &str) -> bool {
+    let mut chars = s.chars();
+
+    // The first char needs to be part of [A-Za-z_]
+    match chars.next() {
+        Some('_') => {}
+        Some(c) if c.is_alphabetic() => {}
+        _ => return false,
+    }
+
+    // After that numbers are allowed as well
+    chars.all(|c| c == '_' || c.is_alphanumeric())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::might_be_python_identifier;
+
+    #[test]
+    fn identifiers() {
+        for s in ["a", "_", "_foo", "foo123", "foo_bar", "café", "变量", "é2"] {
+            assert!(might_be_python_identifier(s), "{s:?}");
+        }
+        for s in ["", "123foo", "123", "foo-bar", "foo bar", "foo.bar", "-foo"] {
+            assert!(!might_be_python_identifier(s), "{s:?}");
+        }
     }
 }

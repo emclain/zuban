@@ -3035,7 +3035,7 @@ impl<'db, 'file> Inference<'db, 'file, '_> {
             might_have_type_vars: true,
         };
         result_context
-            .with_type_if_exists_and_replace_type_var_likes(self.i_s, |type_| {
+            .with_type_if_exists_and_replace_type_var_likes_for_context(self.i_s, |type_| {
                 if let Type::Callable(c) = type_ {
                     let i_s = self.i_s.with_lambda_callable(c);
                     let (params, expr) = lambda.unpack();
@@ -3651,8 +3651,8 @@ impl<'db, 'file> Inference<'db, 'file, '_> {
             }
             PrimaryContent::GetItem(slice_type) => {
                 let f = self.file;
-                // TODO enable this debug
-                //debug!("Get Item on {}", base.format_short(self.i_s));
+                debug!("Get Item on {}", base.format_short(self.i_s));
+                let _indent = debug_indent();
                 base.get_item(
                     self.i_s,
                     &SliceType::new(f, node_index, slice_type),
@@ -3970,7 +3970,11 @@ impl<'db, 'file> Inference<'db, 'file, '_> {
         }
         if use_narrows && let Some(inf) = self.maybe_lookup_narrowed_primary_target(primary_target)
         {
-            return Some(inf);
+            return Some(if self.i_s.db.run_cause == RunCause::LanguageServer {
+                inf.save_redirect(self.i_s, self.file, primary_target.index())
+            } else {
+                inf
+            });
         }
         let second = primary_target.second();
         if self.is_self(primary_target.first())
